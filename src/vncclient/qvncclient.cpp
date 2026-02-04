@@ -378,6 +378,15 @@ private:
     */
     void parseSecurityReason();
 
+    /*!
+        \internal
+        \brief Parses the security result message (RFB 3.8).
+
+        In RFB 3.8, the server sends a 4-byte result after security type selection.
+        0 = success, non-zero = failure followed by a reason string.
+    */
+    void parseSecurityResult();
+
     // Initialisation Messages
     
     /*!
@@ -639,6 +648,9 @@ void QVncClient::Private::read()
         break;
     case SecurityState:
         parseSecurity();
+        break;
+    case SecurityResultState:
+        parseSecurityResult();
         break;
     case ServerInitState:
         parserServerInit();
@@ -902,9 +914,9 @@ void QVncClient::Private::parseProtocolVersion()
     if (value == "RFB 003.003\n")
         q->setProtocolVersion(ProtocolVersion33);
     else if (value == "RFB 003.007\n")
-        q->setProtocolVersion(ProtocolVersion33); // we don't support 3.7 yet
+        q->setProtocolVersion(ProtocolVersion37);
     else if (value == "RFB 003.008\n")
-        q->setProtocolVersion(ProtocolVersion33); // we don't support 3.7 yet
+        q->setProtocolVersion(ProtocolVersion38);
     else
         qCWarning(lcVncClient) << "Unsupported protocol version:" << value;
 }
@@ -1068,6 +1080,29 @@ void QVncClient::Private::parseSecurityReason()
 
 /*!
     \internal
+    Parses the security result message sent by the server in RFB 3.8.
+
+    The server sends a 4-byte status code: 0 indicates success, any other value
+    indicates failure followed by a reason string.
+*/
+void QVncClient::Private::parseSecurityResult()
+{
+    if (socket->bytesAvailable() < 4) {
+        qCDebug(lcVncClient) << "Waiting for security result:" << socket->peek(4);
+        return;
+    }
+    quint32_be result;
+    read(&result);
+    if (result == 0) {
+        state = ClientInitState;
+        clientInit();
+    } else {
+        parseSecurityReason();
+    }
+}
+
+/*!
+    \internal
     Sends the client initialization message to the server.
     
     This message indicates whether the connection will be shared with other clients.
@@ -1223,12 +1258,14 @@ void QVncClient::Private::parseServerMessages()
 */
 void QVncClient::Private::framebufferUpdate()
 {
-    if (socket->bytesAvailable() < 3) return;
+    while (socket->bytesAvailable() < 3)
+        socket->waitForReadyRead();
     socket->read(1); // padding
     quint16_be numberOfRectangles;
     read(&numberOfRectangles);
     for (int i = 0; i < numberOfRectangles; i++) {
-        if (socket->bytesAvailable() < 12) return;
+        while (socket->bytesAvailable() < 12)
+            socket->waitForReadyRead();
         Rectangle rect;
         read(&rect);
         qint32_be encodingType;
