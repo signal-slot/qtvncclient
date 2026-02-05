@@ -22,7 +22,7 @@ public:
     QVncClient *client() const;
     void setPreviewWidget(VncWidget *widget);
 
-    Q_INVOKABLE void connect(const QString &host, int port);
+    Q_INVOKABLE void connect(const QString &host, int port, const QString &password = QString());
     Q_INVOKABLE void disconnect();
     Q_INVOKABLE QImage screenshot(int x = 0, int y = 0, int width = -1, int height = -1) const;
     Q_INVOKABLE bool save(const QString &filePath, int x = 0, int y = 0, int width = -1, int height = -1) const;

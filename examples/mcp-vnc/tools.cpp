@@ -45,8 +45,10 @@ void Tools::setPreviewWidget(VncWidget *widget)
     d->previewWidget = widget;
 }
 
-void Tools::connect(const QString &host, int port)
+void Tools::connect(const QString &host, int port, const QString &password)
 {
+    if (!password.isEmpty())
+        d->vncClient.setPassword(password);
     d->socket.connectToHost(host, port);
 }
 

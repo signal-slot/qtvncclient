@@ -21,6 +21,7 @@ int main(int argc, char *argv[])
         { "connect", "Connect to a VNC server" },
         { "connect/host", "Hostname or IP address of the VNC server" },
         { "connect/port", "Port number of the VNC server (default: 5900)" },
+        { "connect/password", "Password for VNC authentication (optional)" },
         { "disconnect", "Disconnect from the VNC server" },
         { "screenshot", "Take a screenshot of the current VNC screen" },
         { "screenshot/x", "X coordinate of the region (default: 0)" },
