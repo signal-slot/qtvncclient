@@ -1710,6 +1710,7 @@ bool QVncClient::Private::handleZRLEEncoding(const Rectangle &rect)
     QByteArray compressedData = socket->read(zlibDataLength);
 
     // Decompress using persistent zlib stream (dictionary reuse across rects)
+    QByteArray uncompressedData;
 #ifdef USE_ZLIB
     if (!zrleStreamActive) {
         memset(&zrleStream, 0, sizeof(zrleStream));
@@ -1728,7 +1729,6 @@ bool QVncClient::Private::handleZRLEEncoding(const Rectangle &rect)
     zrleStream.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(compressedData.data()));
     zrleStream.avail_in = compressedData.size();
 
-    QByteArray uncompressedData;
     do {
         int prevSize = uncompressedData.size();
         uncompressedData.resize(prevSize + 65536);
