@@ -535,6 +535,8 @@ public:
     QTcpSocket *socket = nullptr;               ///< Socket for VNC communication
 #ifdef USE_ZLIB
     QScopedPointer<TightData> tightData;        ///< Data for Tight encoding
+    z_stream zrleStream;
+    bool zrleStreamActive = false;
 #endif
     ProtocolVersion protocolVersion = ProtocolVersionUnknown; ///< Current protocol version
     SecurityType securityType = SecurityTypeUnknwon;         ///< Current security type
@@ -644,6 +646,9 @@ void QVncClient::Private::reset()
     frameBufferWidth = 0;
     frameBufferHeight = 0;
     image = QImage();
+#ifdef USE_ZLIB
+    if (zrleStreamActive) { inflateEnd(&zrleStream); zrleStreamActive = false; }
+#endif
     emit q->framebufferSizeChanged(0, 0);
 }
 
@@ -698,91 +703,262 @@ void QVncClient::Private::read()
 */
 bool QVncClient::Private::handleTightEncoding(const Rectangle &rect)
 {
-    // Peek to determine total message size without consuming data
     if (socket->bytesAvailable() < 1) return false;
-    const QByteArray peek = socket->peek(qMin(socket->bytesAvailable(), qint64(4)));
-    const quint8 compControl = static_cast<quint8>(peek.at(0));
-    const bool isJpeg = (compControl & 0x0F) == 0x09;
 
-    // Parse compact length from peek data at offset 1
-    auto parseCompactLength = [&](int offset, int *length) -> int {
-        // Returns total bytes used for length encoding, or 0 if not enough data
-        if (peek.size() <= offset) return 0;
-        quint8 b1 = static_cast<quint8>(peek.at(offset));
+    // Calculate TPIXEL size: 3 bytes when bpp=32, trueColor, all maxes == 255
+    const int tpixelSize = (pixelFormat.bitsPerPixel == 32 && pixelFormat.trueColourFlag
+        && pixelFormat.redMax == 255 && pixelFormat.greenMax == 255
+        && pixelFormat.blueMax == 255) ? 3 : (pixelFormat.bitsPerPixel / 8);
+
+    // Helper to read a TPIXEL from a byte buffer
+    auto readTPixel = [&](const char *data, int &off) -> quint32 {
+        quint32 color = 0;
+        if (tpixelSize == 3) {
+            if (pixelFormat.bigEndianFlag) {
+                color = (static_cast<quint8>(data[off]) << 16)
+                      | (static_cast<quint8>(data[off + 1]) << 8)
+                      | static_cast<quint8>(data[off + 2]);
+            } else {
+                color = static_cast<quint8>(data[off])
+                      | (static_cast<quint8>(data[off + 1]) << 8)
+                      | (static_cast<quint8>(data[off + 2]) << 16);
+            }
+        } else if (tpixelSize == 4) {
+            memcpy(&color, data + off, 4);
+        } else if (tpixelSize == 2) {
+            quint16 c16; memcpy(&c16, data + off, 2); color = c16;
+        } else {
+            color = static_cast<quint8>(data[off]);
+        }
+        off += tpixelSize;
+        return color;
+    };
+
+    auto toRgb = [&](quint32 color) -> QRgb {
+        const auto r = (color >> pixelFormat.redShift) & pixelFormat.redMax;
+        const auto g = (color >> pixelFormat.greenShift) & pixelFormat.greenMax;
+        const auto b = (color >> pixelFormat.blueShift) & pixelFormat.blueMax;
+        return qRgb(r, g, b);
+    };
+
+    // Parse VNC compact length from a byte buffer at given offset.
+    // Returns bytes consumed, or 0 if not enough data.
+    auto parseCompactLength = [](const QByteArray &buf, int off, int *length) -> int {
+        if (buf.size() <= off) return 0;
+        quint8 b1 = static_cast<quint8>(buf.at(off));
         if (!(b1 & 0x80)) { *length = b1; return 1; }
-        if (peek.size() <= offset + 2) return 0;
-        quint8 b2 = static_cast<quint8>(peek.at(offset + 1));
-        quint8 b3 = static_cast<quint8>(peek.at(offset + 2));
-        *length = ((b1 & 0x7F) << 16) | (b2 << 8) | b3;
+        if (buf.size() <= off + 1) return 0;
+        quint8 b2 = static_cast<quint8>(buf.at(off + 1));
+        if (!(b2 & 0x80)) { *length = (b1 & 0x7F) | (b2 << 7); return 2; }
+        if (buf.size() <= off + 2) return 0;
+        quint8 b3 = static_cast<quint8>(buf.at(off + 2));
+        *length = (b1 & 0x7F) | ((b2 & 0x7F) << 7) | (b3 << 14);
         return 3;
     };
 
-    // Calculate total bytes needed
-    int dataLength = 0;
-    int lenBytes = parseCompactLength(1, &dataLength);
-    if (lenBytes == 0) return false;
-    qint64 totalNeeded = 1 + lenBytes + dataLength;
-    if (socket->bytesAvailable() < totalNeeded) return false;
+    // Peek enough to parse any Tight header (ctrl + filter + palette + compact len)
+    const qint64 peekSize = qMin(socket->bytesAvailable(), qint64(1 + 1 + 1 + 256 * tpixelSize + 3));
+    const QByteArray peek = socket->peek(peekSize);
+    if (peek.isEmpty()) return false;
 
-    // All data available — consume
-    quint8 ctrl;
-    socket->read(reinterpret_cast<char*>(&ctrl), 1);
+    const quint8 compControl = static_cast<quint8>(peek.at(0));
 
-    // Skip length bytes (already parsed)
-    socket->read(lenBytes);
-
-    if (isJpeg) {
-        if (!handleTightJpeg(rect, dataLength))
-            return true; // skip on error
-        return true;
-    }
-
-    // Non-JPEG: zlib compressed
-    bool resetStream = (ctrl & 0x80) != 0;
-    int streamId = ctrl & 0x03;
-
-    if (resetStream && tightData->zlibStreamActive[streamId]) {
-        inflateEnd(&tightData->zlibStream[streamId]);
-        tightData->zlibStreamActive[streamId] = false;
-    }
-
-    if (!tightData->zlibStreamActive[streamId]) {
-        tightData->zlibStream[streamId].zalloc = Z_NULL;
-        tightData->zlibStream[streamId].zfree = Z_NULL;
-        tightData->zlibStream[streamId].opaque = Z_NULL;
-        inflateInit(&tightData->zlibStream[streamId]);
-        tightData->zlibStreamActive[streamId] = true;
-    }
-
-    QByteArray compressedData = socket->read(dataLength);
-
-    int expectedBytes = rect.w * rect.h * (pixelFormat.bitsPerPixel / 8);
-    QByteArray uncompressedData = decompressTightData(streamId, compressedData, expectedBytes);
-    if (uncompressedData.isEmpty()) {
-        qCWarning(lcVncClient) << "Failed to decompress Tight encoded data";
-        return true; // skip
-    }
-
-    const unsigned char* data = reinterpret_cast<const unsigned char*>(uncompressedData.constData());
-    for (int y = 0; y < rect.h; y++) {
-        for (int x = 0; x < rect.w; x++) {
-            int offset = (y * rect.w + x) * (pixelFormat.bitsPerPixel / 8);
-            quint32 color = 0;
-            if (pixelFormat.bitsPerPixel == 32)
-                color = *reinterpret_cast<const quint32*>(data + offset);
-            else if (pixelFormat.bitsPerPixel == 24)
-                color = data[offset] | (data[offset + 1] << 8) | (data[offset + 2] << 16);
-            else if (pixelFormat.bitsPerPixel == 16)
-                color = *reinterpret_cast<const quint16*>(data + offset);
-            else if (pixelFormat.bitsPerPixel == 8)
-                color = data[offset];
-            const auto r = (color >> pixelFormat.redShift) & pixelFormat.redMax;
-            const auto g = (color >> pixelFormat.greenShift) & pixelFormat.greenMax;
-            const auto b = (color >> pixelFormat.blueShift) & pixelFormat.blueMax;
-            image.setPixel(rect.x + x, rect.y + y, qRgb(r, g, b));
+    // Process stream reset flags (bits 0-3)
+    for (int i = 0; i < 4; i++) {
+        if ((compControl & (1 << i)) && tightData->zlibStreamActive[i]) {
+            inflateEnd(&tightData->zlibStream[i]);
+            tightData->zlibStreamActive[i] = false;
         }
     }
-    return true;
+
+    // Extract compression type from bits 4-7
+    const int compType = compControl >> 4;
+
+    if (compType == 0x08) {
+        // --- Fill compression: 1 TPIXEL, no compact length, no zlib ---
+        const qint64 totalNeeded = 1 + tpixelSize;
+        if (socket->bytesAvailable() < totalNeeded) return false;
+
+        socket->read(1); // control byte
+        QByteArray pixelData = socket->read(tpixelSize);
+        int off = 0;
+        QRgb rgb = toRgb(readTPixel(pixelData.constData(), off));
+        for (int y = 0; y < rect.h; y++)
+            for (int x = 0; x < rect.w; x++)
+                image.setPixel(rect.x + x, rect.y + y, rgb);
+        return true;
+
+    } else if (compType == 0x09) {
+        // --- JPEG compression: compact length + JPEG data ---
+        int dataLength = 0;
+        int lenBytes = parseCompactLength(peek, 1, &dataLength);
+        if (lenBytes == 0) return false;
+
+        const qint64 totalNeeded = 1 + lenBytes + dataLength;
+        if (socket->bytesAvailable() < totalNeeded) return false;
+
+        socket->read(1);        // control byte
+        socket->read(lenBytes); // compact length bytes
+        handleTightJpeg(rect, dataLength);
+        return true;
+
+    } else {
+        // --- Basic compression (compType 0-7) ---
+        const int streamId = compType & 0x03;
+        const bool hasFilter = (compType & 0x04) != 0;
+
+        int off = 1; // past control byte
+        int filterId = 0; // default: Copy
+        int numColors = 0;
+        int paletteDataBytes = 0;
+
+        if (hasFilter) {
+            if (peek.size() <= off) return false;
+            filterId = static_cast<quint8>(peek.at(off));
+            off++;
+        }
+
+        if (filterId == 1) { // Palette filter
+            if (peek.size() <= off) return false;
+            numColors = static_cast<quint8>(peek.at(off)) + 1;
+            off++;
+            paletteDataBytes = numColors * tpixelSize;
+            if (peek.size() < off + paletteDataBytes) return false;
+            off += paletteDataBytes;
+        }
+
+        // Calculate uncompressed data size
+        int dataSize = 0;
+        if (filterId == 1) {
+            dataSize = (numColors <= 2) ? (((rect.w + 7) / 8) * rect.h)
+                                        : (rect.w * rect.h);
+        } else {
+            // Copy (0) or Gradient (2)
+            dataSize = rect.w * rect.h * tpixelSize;
+        }
+
+        qint64 totalNeeded;
+        int compressedLength = 0;
+        int lenBytes = 0;
+
+        if (dataSize < 12) {
+            // Small data: sent raw, no compact length, no zlib
+            totalNeeded = off + dataSize;
+        } else {
+            // Larger data: compact length + zlib compressed
+            lenBytes = parseCompactLength(peek, off, &compressedLength);
+            if (lenBytes == 0) return false;
+            totalNeeded = off + lenBytes + compressedLength;
+        }
+
+        if (socket->bytesAvailable() < totalNeeded) return false;
+
+        // --- All data available: consume ---
+        socket->read(1); // control byte
+        if (hasFilter) socket->read(1); // filter ID
+
+        // Read palette
+        QVector<QRgb> palette;
+        if (filterId == 1) {
+            socket->read(1); // numColors - 1
+            QByteArray paletteRaw = socket->read(paletteDataBytes);
+            palette.resize(numColors);
+            int pOff = 0;
+            for (int i = 0; i < numColors; i++)
+                palette[i] = toRgb(readTPixel(paletteRaw.constData(), pOff));
+        }
+
+        // Read pixel data (raw or zlib-compressed)
+        QByteArray pixelData;
+        if (dataSize < 12) {
+            pixelData = socket->read(dataSize);
+        } else {
+            socket->read(lenBytes); // compact length bytes
+            QByteArray compressedData = socket->read(compressedLength);
+
+            // Ensure zlib stream is initialized
+            if (!tightData->zlibStreamActive[streamId]) {
+                memset(&tightData->zlibStream[streamId], 0, sizeof(z_stream));
+                tightData->zlibStream[streamId].zalloc = Z_NULL;
+                tightData->zlibStream[streamId].zfree = Z_NULL;
+                tightData->zlibStream[streamId].opaque = Z_NULL;
+                inflateInit(&tightData->zlibStream[streamId]);
+                tightData->zlibStreamActive[streamId] = true;
+            }
+
+            pixelData = decompressTightData(streamId, compressedData, dataSize);
+            if (pixelData.isEmpty()) {
+                qCWarning(lcVncClient) << "Failed to decompress Tight Basic data";
+                return true;
+            }
+        }
+
+        // --- Decode pixels based on filter ---
+        if (filterId == 1) {
+            // Palette filter
+            if (numColors <= 2) {
+                // 1 bit per pixel, rows padded to byte boundary
+                int byteIdx = 0;
+                for (int y = 0; y < rect.h; y++) {
+                    int bitOff = 0;
+                    for (int x = 0; x < rect.w; x++) {
+                        if (byteIdx >= pixelData.size()) break;
+                        int index = (static_cast<quint8>(pixelData.at(byteIdx)) >> (7 - bitOff)) & 1;
+                        if (index < numColors)
+                            image.setPixel(rect.x + x, rect.y + y, palette[index]);
+                        if (++bitOff == 8) { bitOff = 0; byteIdx++; }
+                    }
+                    if (bitOff > 0) { byteIdx++; } // pad to byte boundary
+                }
+            } else {
+                // 8 bits per pixel
+                for (int y = 0; y < rect.h; y++) {
+                    for (int x = 0; x < rect.w; x++) {
+                        int idx = y * rect.w + x;
+                        if (idx >= pixelData.size()) break;
+                        int ci = static_cast<quint8>(pixelData.at(idx));
+                        if (ci < numColors)
+                            image.setPixel(rect.x + x, rect.y + y, palette[ci]);
+                    }
+                }
+            }
+        } else if (filterId == 2) {
+            // Gradient filter: predict pixel from neighbors, data is error term
+            QVector<QRgb> prevRow(rect.w, qRgb(0, 0, 0));
+            QVector<QRgb> row(rect.w);
+            int dOff = 0;
+            for (int y = 0; y < rect.h; y++) {
+                for (int x = 0; x < rect.w; x++) {
+                    quint32 est = readTPixel(pixelData.constData(), dOff);
+                    int eR = (est >> pixelFormat.redShift) & 0xFF;
+                    int eG = (est >> pixelFormat.greenShift) & 0xFF;
+                    int eB = (est >> pixelFormat.blueShift) & 0xFF;
+
+                    int lR = 0, lG = 0, lB = 0;
+                    int aR = 0, aG = 0, aB = 0;
+                    int alR = 0, alG = 0, alB = 0;
+                    if (x > 0) { lR = qRed(row[x-1]); lG = qGreen(row[x-1]); lB = qBlue(row[x-1]); }
+                    if (y > 0) { aR = qRed(prevRow[x]); aG = qGreen(prevRow[x]); aB = qBlue(prevRow[x]); }
+                    if (x > 0 && y > 0) { alR = qRed(prevRow[x-1]); alG = qGreen(prevRow[x-1]); alB = qBlue(prevRow[x-1]); }
+
+                    QRgb rgb = qRgb((qBound(0, lR + aR - alR, 255) + eR) & 0xFF,
+                                    (qBound(0, lG + aG - alG, 255) + eG) & 0xFF,
+                                    (qBound(0, lB + aB - alB, 255) + eB) & 0xFF);
+                    row[x] = rgb;
+                    image.setPixel(rect.x + x, rect.y + y, rgb);
+                }
+                prevRow = row;
+            }
+        } else {
+            // Copy filter (filter 0 or default)
+            int dOff = 0;
+            for (int y = 0; y < rect.h; y++)
+                for (int x = 0; x < rect.w; x++)
+                    image.setPixel(rect.x + x, rect.y + y, toRgb(readTPixel(pixelData.constData(), dOff)));
+        }
+
+        return true;
+    }
 }
 #endif
 
