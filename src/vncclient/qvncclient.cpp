@@ -1707,211 +1707,217 @@ bool QVncClient::Private::handleZRLEEncoding(const Rectangle &rect)
 
     // All data available — consume
     read(&zlibDataLength);
-    
     QByteArray compressedData = socket->read(zlibDataLength);
-    
-    // Use Qt's own QByteArray-based zlib decompression
-    QByteArray uncompressedData = qUncompress(compressedData);
+
+    // Decompress using persistent zlib stream (dictionary reuse across rects)
+#ifdef USE_ZLIB
+    if (!zrleStreamActive) {
+        memset(&zrleStream, 0, sizeof(zrleStream));
+        zrleStream.zalloc = Z_NULL;
+        zrleStream.zfree = Z_NULL;
+        zrleStream.opaque = Z_NULL;
+        zrleStream.avail_in = 0;
+        zrleStream.next_in = Z_NULL;
+        if (inflateInit(&zrleStream) != Z_OK) {
+            qCWarning(lcVncClient) << "Failed to initialize ZRLE zlib stream";
+            return true;
+        }
+        zrleStreamActive = true;
+    }
+
+    zrleStream.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(compressedData.data()));
+    zrleStream.avail_in = compressedData.size();
+
+    QByteArray uncompressedData;
+    do {
+        int prevSize = uncompressedData.size();
+        uncompressedData.resize(prevSize + 65536);
+        zrleStream.next_out = reinterpret_cast<Bytef*>(uncompressedData.data() + prevSize);
+        zrleStream.avail_out = 65536;
+
+        int ret = inflate(&zrleStream, Z_SYNC_FLUSH);
+        uncompressedData.resize(prevSize + 65536 - zrleStream.avail_out);
+
+        if (ret != Z_OK && ret != Z_STREAM_END && ret != Z_BUF_ERROR) {
+            qCWarning(lcVncClient) << "ZRLE zlib inflate failed:" << ret;
+            return true;
+        }
+        if (ret == Z_STREAM_END || zrleStream.avail_in == 0)
+            break;
+    } while (zrleStream.avail_out == 0);
+#else
+    qCWarning(lcVncClient) << "ZRLE encoding requires zlib support";
+    return true;
+#endif
+
     if (uncompressedData.isEmpty()) {
         qCWarning(lcVncClient) << "Failed to decompress ZRLE data";
-        return true; // skip
+        return true;
     }
-    
-    // Process the decompressed data
+
+    // CPIXEL size: 3 bytes when bpp=32, trueColor, all maxes <= 255
+    const int cpixelSize = (pixelFormat.bitsPerPixel == 32 && pixelFormat.trueColourFlag
+        && pixelFormat.redMax <= 255 && pixelFormat.greenMax <= 255
+        && pixelFormat.blueMax <= 255) ? 3 : (pixelFormat.bitsPerPixel / 8);
+
+    const char *buf = uncompressedData.constData();
+    const int bufSize = uncompressedData.size();
     int dataOffset = 0;
-    
+
+    // Helper to read a CPIXEL from the decompressed buffer
+    auto readCPixel = [&]() -> quint32 {
+        quint32 color = 0;
+        if (dataOffset + cpixelSize > bufSize) return 0;
+        if (cpixelSize == 3) {
+            if (pixelFormat.bigEndianFlag) {
+                color = (static_cast<quint8>(buf[dataOffset]) << 16)
+                      | (static_cast<quint8>(buf[dataOffset + 1]) << 8)
+                      | static_cast<quint8>(buf[dataOffset + 2]);
+            } else {
+                color = static_cast<quint8>(buf[dataOffset])
+                      | (static_cast<quint8>(buf[dataOffset + 1]) << 8)
+                      | (static_cast<quint8>(buf[dataOffset + 2]) << 16);
+            }
+        } else if (cpixelSize == 4) {
+            memcpy(&color, buf + dataOffset, 4);
+        } else if (cpixelSize == 2) {
+            memcpy(&color, buf + dataOffset, 2);
+        } else {
+            color = static_cast<quint8>(buf[dataOffset]);
+        }
+        dataOffset += cpixelSize;
+        return color;
+    };
+
+    auto toRgb = [&](quint32 color) -> QRgb {
+        const auto r = (color >> pixelFormat.redShift) & pixelFormat.redMax;
+        const auto g = (color >> pixelFormat.greenShift) & pixelFormat.greenMax;
+        const auto b = (color >> pixelFormat.blueShift) & pixelFormat.blueMax;
+        return qRgb(r, g, b);
+    };
+
     // Each tile is 64x64 pixels
     const int tileWidth = 64;
     const int tileHeight = 64;
-    
-    // Determine bytes per pixel (always 1 in ZRLE)
-    const int bytesPerPixel = pixelFormat.bitsPerPixel / 8;
-    
-    // Process each tile
+
     for (int ty = 0; ty < rect.h; ty += tileHeight) {
         const int th = qMin(tileHeight, rect.h - ty);
-        
+
         for (int tx = 0; tx < rect.w; tx += tileWidth) {
             const int tw = qMin(tileWidth, rect.w - tx);
 
-            // Read subencoding type (one byte) 
-            // 0=raw, 1=solid, 2=packed palette, 3=RLE palette, 8-127=plain RLE
-            if (dataOffset >= uncompressedData.size()) {
+            if (dataOffset >= bufSize) {
                 qCWarning(lcVncClient) << "ZRLE data truncated (subencoding)";
-                return true; // skip
+                return true;
             }
-            
-            quint8 subencoding = static_cast<quint8>(uncompressedData.at(dataOffset++));
-            
-            // Handle the different subencodings
-            if (subencoding == 0) { // Raw pixels
-                // Raw pixel data
-                int expectedBytes = tw * th * 4; // ZRLE always uses 32bpp
-                
-                if (dataOffset + expectedBytes > uncompressedData.size()) {
-                    qCWarning(lcVncClient) << "ZRLE data truncated (raw data)";
-                    continue;
-                }
-                
-                for (int y = 0; y < th; y++) {
-                    for (int x = 0; x < tw; x++) {
-                        quint32 color = 0;
-                        
-                        // Read pixel data according to bpp
-                        if (bytesPerPixel == 4) {
-                            color = *reinterpret_cast<const quint32*>(uncompressedData.constData() + dataOffset);
-                            dataOffset += 4;
-                        } else if (bytesPerPixel == 3) {
-                            color = *reinterpret_cast<const quint8*>(uncompressedData.constData() + dataOffset) |
-                                   (*reinterpret_cast<const quint8*>(uncompressedData.constData() + dataOffset + 1) << 8) |
-                                   (*reinterpret_cast<const quint8*>(uncompressedData.constData() + dataOffset + 2) << 16);
-                            dataOffset += 3;
-                        } else if (bytesPerPixel == 2) {
-                            color = *reinterpret_cast<const quint16*>(uncompressedData.constData() + dataOffset);
-                            dataOffset += 2;
-                        } else if (bytesPerPixel == 1) {
-                            color = *reinterpret_cast<const quint8*>(uncompressedData.constData() + dataOffset);
-                            dataOffset += 1;
-                        }
-                        
-                        // Convert to RGB and set pixel
-                        const auto r = (color >> pixelFormat.redShift) & pixelFormat.redMax;
-                        const auto g = (color >> pixelFormat.greenShift) & pixelFormat.greenMax;
-                        const auto b = (color >> pixelFormat.blueShift) & pixelFormat.blueMax;
-                        image.setPixel(rect.x + tx + x, rect.y + ty + y, qRgb(r, g, b));
-                    }
-                }
+
+            const quint8 subencoding = static_cast<quint8>(buf[dataOffset++]);
+
+            if (subencoding == 0) {
+                // Raw pixels: cpixelSize * tw * th bytes
+                for (int y = 0; y < th; y++)
+                    for (int x = 0; x < tw; x++)
+                        image.setPixel(rect.x + tx + x, rect.y + ty + y, toRgb(readCPixel()));
+
             } else if (subencoding == 1) {
-                // Solid tile - single color for all pixels
-                if (dataOffset + bytesPerPixel > uncompressedData.size()) {
-                    qCWarning(lcVncClient) << "ZRLE data truncated (solid color)";
-                    continue;
-                }
-                
-                quint32 color = *reinterpret_cast<const quint32*>(uncompressedData.constData() + dataOffset);
-                dataOffset += 4;
-                
-                const auto r = (color >> pixelFormat.redShift) & pixelFormat.redMax;
-                const auto g = (color >> pixelFormat.greenShift) & pixelFormat.greenMax;
-                const auto b = (color >> pixelFormat.blueShift) & pixelFormat.blueMax;
-                QRgb rgbColor = qRgb(r, g, b);
-                
-                // Fill the entire tile with this color
-                for (int y = 0; y < th; y++) {
-                    for (int x = 0; x < tw; x++) {
-                        image.setPixel(rect.x + tx + x, rect.y + ty + y, rgbColor);
-                    }
-                }
-            } else if (subencoding == 2) {
-                // Packed Palette encoding
-                // First byte is the palette size (1-127)
-                if (dataOffset >= uncompressedData.size()) {
-                    qCWarning(lcVncClient) << "ZRLE data truncated (palette size)";
-                    continue;
-                }
-                
-                quint8 paletteSize = static_cast<quint8>(uncompressedData.at(dataOffset++));
-                if (paletteSize == 0 || dataOffset + (paletteSize * 4) > uncompressedData.size()) {
-                    qCWarning(lcVncClient) << "ZRLE data truncated (palette colors)";
-                    continue;
-                }
-                
-                // Read the palette
+                // Solid tile: 1 CPIXEL
+                QRgb rgb = toRgb(readCPixel());
+                for (int y = 0; y < th; y++)
+                    for (int x = 0; x < tw; x++)
+                        image.setPixel(rect.x + tx + x, rect.y + ty + y, rgb);
+
+            } else if (subencoding >= 2 && subencoding <= 16) {
+                // Packed palette: palette size = subencoding value
+                const int paletteSize = subencoding;
                 QVector<QRgb> palette(paletteSize);
-                for (int i = 0; i < paletteSize; i++) {
-                    quint32 color = *reinterpret_cast<const quint32*>(uncompressedData.constData() + dataOffset);
-                    dataOffset += 4;
-                    
-                    const auto r = (color >> pixelFormat.redShift) & pixelFormat.redMax;
-                    const auto g = (color >> pixelFormat.greenShift) & pixelFormat.greenMax;
-                    const auto b = (color >> pixelFormat.blueShift) & pixelFormat.blueMax;
-                    palette[i] = qRgb(r, g, b);
-                }
-                
-                // Determine bits per palette entry
-                int bitsPerPaletteEntry;
-                if (paletteSize <= 2) {
-                    bitsPerPaletteEntry = 1;
-                } else if (paletteSize <= 4) {
-                    bitsPerPaletteEntry = 2;
-                } else if (paletteSize <= 16) {
-                    bitsPerPaletteEntry = 4;
-                } else {
-                    bitsPerPaletteEntry = 8;
-                }
-                
-                // Calculate bytes needed for packed palette data
-                int bytesPerLine = (tw * bitsPerPaletteEntry + 7) / 8;
-                int totalBytes = bytesPerLine * th;
-                
-                if (dataOffset + totalBytes > uncompressedData.size()) {
-                    qCWarning(lcVncClient) << "ZRLE data truncated (packed data)";
-                    continue;
-                }
-                
-                // Process each pixel
-                int byteOffset = 0;
+                for (int i = 0; i < paletteSize; i++)
+                    palette[i] = toRgb(readCPixel());
+
+                const int bitsPerIndex = (paletteSize == 2) ? 1
+                                       : (paletteSize <= 4) ? 2 : 4;
+                const int bytesPerRow = (tw * bitsPerIndex + 7) / 8;
+
                 for (int y = 0; y < th; y++) {
-                    int bitOffset = 0;
-                    
+                    int rowStart = dataOffset;
+                    int bitPos = 0;
                     for (int x = 0; x < tw; x++) {
-                        // Extract palette index from packed data
-                        int index = 0;
-                        
-                        if (bitsPerPaletteEntry == 1) {
-                            // 1 bit per entry (palette size <= 2)
-                            quint8 byte = static_cast<quint8>(uncompressedData.at(dataOffset + byteOffset));
-                            index = (byte >> (7 - bitOffset)) & 0x01;
-                            bitOffset++;
-                            if (bitOffset == 8) {
-                                bitOffset = 0;
-                                byteOffset++;
-                            }
-                        } else if (bitsPerPaletteEntry == 2) {
-                            // 2 bits per entry (palette size <= 4)
-                            quint8 byte = static_cast<quint8>(uncompressedData.at(dataOffset + byteOffset));
-                            index = (byte >> (6 - bitOffset)) & 0x03;
-                            bitOffset += 2;
-                            if (bitOffset == 8) {
-                                bitOffset = 0;
-                                byteOffset++;
-                            }
-                        } else if (bitsPerPaletteEntry == 4) {
-                            // 4 bits per entry (palette size <= 16)
-                            quint8 byte = static_cast<quint8>(uncompressedData.at(dataOffset + byteOffset));
-                            index = (byte >> (4 - bitOffset)) & 0x0f;
-                            bitOffset += 4;
-                            if (bitOffset == 8) {
-                                bitOffset = 0;
-                                byteOffset++;
-                            }
-                        } else { // bitsPerPaletteEntry == 8
-                            // 8 bits per entry (palette size <= 127)
-                            index = static_cast<quint8>(uncompressedData.at(dataOffset + byteOffset++)) & 0x7f;
-                        }
-                        
-                        // Set the pixel color from the palette
-                        if (index < paletteSize) {
+                        int byteIdx = dataOffset + bitPos / 8;
+                        if (byteIdx >= bufSize) break;
+                        int shift = 8 - bitsPerIndex - (bitPos % 8);
+                        int mask = (1 << bitsPerIndex) - 1;
+                        int index = (static_cast<quint8>(buf[byteIdx]) >> shift) & mask;
+                        bitPos += bitsPerIndex;
+                        if (index < paletteSize)
                             image.setPixel(rect.x + tx + x, rect.y + ty + y, palette[index]);
-                        }
                     }
-                    
-                    // Move to the next complete line
-                    if (bitsPerPaletteEntry < 8 && bitOffset > 0) {
-                        byteOffset++;
-                        bitOffset = 0;
+                    dataOffset = rowStart + bytesPerRow;
+                }
+
+            } else if (subencoding == 128) {
+                // Plain RLE: (CPIXEL, runLength) pairs
+                const int totalPixels = tw * th;
+                int pixels = 0;
+                while (pixels < totalPixels) {
+                    QRgb rgb = toRgb(readCPixel());
+                    int runLength = 0;
+                    quint8 b;
+                    do {
+                        if (dataOffset >= bufSize) break;
+                        b = static_cast<quint8>(buf[dataOffset++]);
+                        runLength += b;
+                    } while (b == 255);
+                    runLength += 1;
+
+                    for (int i = 0; i < runLength && pixels < totalPixels; i++, pixels++) {
+                        image.setPixel(rect.x + tx + pixels % tw,
+                                       rect.y + ty + pixels / tw, rgb);
                     }
                 }
-                
-                dataOffset += totalBytes;
-            } else if (subencoding == 3) {
-                // RLE Palette encoding - skip for now
-                qCWarning(lcVncClient) << "RLE Palette encoding (type 3) not fully implemented";
-                continue;
+
+            } else if (subencoding >= 130) {
+                // Palette RLE: palette of (sub - 128) CPIXELs, then RLE with indices
+                const int paletteSize = subencoding - 128;
+                QVector<QRgb> palette(paletteSize);
+                for (int i = 0; i < paletteSize; i++)
+                    palette[i] = toRgb(readCPixel());
+
+                const int totalPixels = tw * th;
+                int pixels = 0;
+                while (pixels < totalPixels) {
+                    if (dataOffset >= bufSize) break;
+                    quint8 indexByte = static_cast<quint8>(buf[dataOffset++]);
+
+                    if (indexByte & 0x80) {
+                        // Run: index = low 7 bits, followed by run length
+                        int paletteIndex = indexByte & 0x7F;
+                        int runLength = 0;
+                        quint8 b;
+                        do {
+                            if (dataOffset >= bufSize) break;
+                            b = static_cast<quint8>(buf[dataOffset++]);
+                            runLength += b;
+                        } while (b == 255);
+                        runLength += 1;
+
+                        QRgb rgb = (paletteIndex < paletteSize)
+                                 ? palette[paletteIndex] : qRgb(0, 0, 0);
+                        for (int i = 0; i < runLength && pixels < totalPixels; i++, pixels++) {
+                            image.setPixel(rect.x + tx + pixels % tw,
+                                           rect.y + ty + pixels / tw, rgb);
+                        }
+                    } else {
+                        // Single pixel
+                        QRgb rgb = (indexByte < paletteSize)
+                                 ? palette[indexByte] : qRgb(0, 0, 0);
+                        image.setPixel(rect.x + tx + pixels % tw,
+                                       rect.y + ty + pixels / tw, rgb);
+                        pixels++;
+                    }
+                }
+
             } else {
-                // Plain RLE (8-127) - skip for now
-                qCWarning(lcVncClient) << "Plain RLE encoding (types 8-127) not implemented";
-                continue;
+                // Unused subencodings (17-127, 129): skip tile
+                qCWarning(lcVncClient) << "ZRLE unsupported subencoding:" << subencoding;
             }
         }
     }
