@@ -64,6 +64,26 @@
         </widget>
        </item>
        <item>
+        <widget class="QLabel" name="passwordLabel">
+         <property name="text">
+          <string>&amp;Password:</string>
+         </property>
+         <property name="buddy">
+          <cstring>password</cstring>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QLineEdit" name="password">
+         <property name="echoMode">
+          <enum>QLineEdit::Password</enum>
+         </property>
+         <property name="placeholderText">
+          <string>(optional)</string>
+         </property>
+        </widget>
+       </item>
+       <item>
         <widget class="QPushButton" name="watch">
          <property name="text">
           <string>&amp;Watch</string>
@@ -118,6 +138,7 @@
  <tabstops>
   <tabstop>server</tabstop>
   <tabstop>port</tabstop>
+  <tabstop>password</tabstop>
   <tabstop>watch</tabstop>
  </tabstops>
  <resources/>

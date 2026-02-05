@@ -3,3 +3,4 @@
 
 # Add the tst_qvncclient directory
 add_subdirectory(qvncclient)
+add_subdirectory(qvncdes)

@@ -18,6 +18,7 @@ qt_internal_add_module(VncClient
         qvncclient.cpp
         qtvncclientlogging.cpp
         qvncclient.h
+        qvncdes_p.h
     INCLUDE_DIRECTORIES
         ${CMAKE_CURRENT_SOURCE_DIR}
     PUBLIC_LIBRARIES

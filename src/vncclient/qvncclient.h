@@ -18,6 +18,7 @@ class Q_VNCCLIENT_EXPORT QVncClient : public QObject
     Q_PROPERTY(QTcpSocket *socket READ socket WRITE setSocket NOTIFY socketChanged)
     Q_PROPERTY(ProtocolVersion protocolVersion READ protocolVersion NOTIFY protocolVersionChanged)
     Q_PROPERTY(SecurityType securityType READ securityType NOTIFY securityTypeChanged)
+    Q_PROPERTY(QString password READ password WRITE setPassword NOTIFY passwordChanged)
 public:
     enum ProtocolVersion {
         ProtocolVersionUnknown,
@@ -57,14 +58,16 @@ public:
     
     // Get current image
     QImage image() const;
-    
+    QString password() const;
+
     // Process input events
     void handleKeyEvent(QKeyEvent *e);
     void handlePointerEvent(QMouseEvent *e);
 
 public slots:
     void setSocket(QTcpSocket *socket);
-    
+    void setPassword(const QString &password);
+
 private:
     void setProtocolVersion(ProtocolVersion protocolVersion);
     void setSecurityType(SecurityType securityType);
@@ -76,6 +79,8 @@ signals:
     void framebufferSizeChanged(int width, int height);
     void imageChanged(const QRect &rect);
     void connectionStateChanged(bool connected);
+    void passwordChanged(const QString &password);
+    void passwordRequested();
 
 private:
     class Private;

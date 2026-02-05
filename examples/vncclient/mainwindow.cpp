@@ -39,6 +39,9 @@ MainWindow::Private::Private(::MainWindow *parent)
     connect(port, &SpinBox::returnPressed, q, [this]() {
         watch->animateClick();
     });
+    connect(password, &QLineEdit::returnPressed, q, [this]() {
+        watch->animateClick();
+    });
     
     // Set up the VNC client
     stackedWidget->setCurrentIndex(0);
@@ -67,12 +70,19 @@ MainWindow::Private::Private(::MainWindow *parent)
     if (socket.state() == QTcpSocket::UnconnectedState)
         timer.start();
     
+    // Handle server requesting password when none was set
+    connect(&vncClient, &QVncClient::passwordRequested, q, [this]() {
+        stackedWidget->setCurrentIndex(0);
+        password->setFocus();
+    });
+
     // Connect watch button
     connect(watch, &QPushButton::clicked, q, [this]() {
         settings.beginGroup("Window");
         settings.setValue("small_geometry", q->saveGeometry());
         settings.setValue("server", server->text());
         settings.setValue("port", port->value());
+        vncClient.setPassword(password->text());
         socket.connectToHost(server->text(), port->value());
         stackedWidget->setCurrentIndex(1);
         vnc->setFocus();

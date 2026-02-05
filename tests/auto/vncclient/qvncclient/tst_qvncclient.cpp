@@ -336,12 +336,12 @@ void tst_qvncclient::testFramebufferSize()
     QVERIFY2(socket->waitForConnected(5000), 
             qPrintable(QString("Failed to connect to VNC server: %1").arg(socket->errorString())));
     
-    // Wait for framebuffer size signal (this comes a bit later in the protocol)
-    QTRY_VERIFY_WITH_TIMEOUT(framebufferSizeSpy.count() > 0, 5000);
-    
-    // Get size values from the signal and from the client
-    int signalWidth = framebufferSizeSpy.first().at(0).toInt();
-    int signalHeight = framebufferSizeSpy.first().at(1).toInt();
+    // Wait for a non-zero framebuffer size signal (reset() emits (0,0) during setSocket)
+    QTRY_VERIFY_WITH_TIMEOUT(client.framebufferWidth() > 0, 5000);
+
+    // Get size values from the last signal (skip any (0,0) from reset)
+    int signalWidth = framebufferSizeSpy.last().at(0).toInt();
+    int signalHeight = framebufferSizeSpy.last().at(1).toInt();
     
     // Verify dimensions match
     QCOMPARE(signalWidth, client.framebufferWidth());

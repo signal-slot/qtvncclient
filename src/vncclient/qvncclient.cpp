@@ -33,6 +33,7 @@
 // For Qt Help integration, build with: qdoc src/vncclient/vncclient.qdocconf
 //
 #include "qvncclient.h"
+#include "qvncdes_p.h"
 
 #include <QtCore/QDebug>
 #include <QtCore/QtEndian>
@@ -71,6 +72,7 @@ public:
         ProtocolVersionState = 0x611, ///< Negotiating the protocol version
         SecurityState = 0x612,        ///< Negotiating security type
         SecurityResultState = 0x613,  ///< Processing security handshake result
+        VncAuthenticationState = 0x614, ///< VNC authentication challenge-response
         ClientInitState = 0x631,      ///< Client initialization
         ServerInitState = 0x632,      ///< Server initialization
         WaitingState = 0x640,         ///< Normal operation state, waiting for server messages
@@ -377,13 +379,15 @@ private:
         Reads and logs the reason string provided by the server when security negotiation fails.
     */
     void parseSecurityReason();
+    void parseVncAuthentication();
+    void sendVncAuthResponse();
 
     /*!
         \internal
-        \brief Parses the security result message (RFB 3.8).
+        \brief Parses the security result message.
 
-        In RFB 3.8, the server sends a 4-byte result after security type selection.
-        0 = success, non-zero = failure followed by a reason string.
+        The server sends a 4-byte result after authentication.
+        0 = success, non-zero = failure (3.8 includes a reason string).
     */
     void parseSecurityResult();
 
@@ -454,6 +458,7 @@ private:
         Reads the number of rectangles and processes each one based on its encoding type.
     */
     void framebufferUpdate();
+    void processFramebufferRects();
     
     /*!
         \internal
@@ -462,28 +467,10 @@ private:
         
         Processes uncompressed pixel data for the specified rectangle.
     */
-    void handleRawEncoding(const Rectangle &rect);
-    
-    /*!
-        \internal
-        \brief Handles hextile-encoded rectangle data.
-        \param rect The rectangle dimensions.
-        
-        Processes hextile-encoded data for the specified rectangle, which divides
-        the rectangle into 16x16 tiles with various subencodings.
-    */
-    void handleHextileEncoding(const Rectangle &rect);
-    
+    bool handleRawEncoding(const Rectangle &rect);
+    bool handleHextileEncoding(const Rectangle &rect);
 #ifdef USE_ZLIB
-    /*!
-        \internal
-        \brief Handles tight-encoded rectangle data.
-        \param rect The rectangle dimensions.
-        
-        Processes Tight-encoded data for the specified rectangle, which may use
-        zlib compression, JPEG compression, or various other subencodings.
-    */
-    void handleTightEncoding(const Rectangle &rect);
+    bool handleTightEncoding(const Rectangle &rect);
 #endif
     
     /*!
@@ -520,12 +507,28 @@ private:
         
         Processes ZRLE (Zlib Run-Length Encoding) data for the specified rectangle.
     */
-    void handleZRLEEncoding(const Rectangle &rect);
+    bool handleZRLEEncoding(const Rectangle &rect);
 
 private:
     QVncClient *q;                              ///< Pointer to the public class
     QTcpSocket *prev = nullptr;                 ///< Previous socket for cleanup
     HandshakingState state = ProtocolVersionState; ///< Current protocol state
+    bool reading = false;                           ///< Reentrancy guard for read()
+
+    // Framebuffer update state for non-blocking processing
+    struct {
+        int totalRects = 0;
+        int currentRect = 0;
+        Rectangle rect;
+        int encoding = -1;
+        bool active = false;       ///< Currently processing a framebuffer update
+        bool rectHeaderRead = false; ///< Current rect header has been read
+        // Hextile resume state
+        int hextileTY = 0;
+        int hextileTX = 0;
+        quint32 hextileBG = 0;
+        quint32 hextileFG = 0;
+    } fbu;
     PixelFormat pixelFormat;                    ///< Current pixel format
     QMap<int, quint32> keyMap;                  ///< Map from Qt keys to VNC key codes
 public:
@@ -535,6 +538,8 @@ public:
 #endif
     ProtocolVersion protocolVersion = ProtocolVersionUnknown; ///< Current protocol version
     SecurityType securityType = SecurityTypeUnknwon;         ///< Current security type
+    QString password;                             ///< Stored password for VNC authentication
+    QByteArray vncChallenge;                     ///< Stored challenge for deferred VNC auth
     QImage image;                               ///< Image containing the framebuffer
     int frameBufferWidth = 0;                   ///< Framebuffer width
     int frameBufferHeight = 0;                  ///< Framebuffer height
@@ -623,6 +628,10 @@ QVncClient::Private::Private(QVncClient *parent)
     connect(q, &QVncClient::securityTypeChanged, q, [this](SecurityType securityType) {
         securityTypeChanged(securityType);
     });
+    connect(q, &QVncClient::passwordChanged, q, [this](const QString &) {
+        if (state == VncAuthenticationState && !vncChallenge.isEmpty() && !password.isEmpty())
+            sendVncAuthResponse();
+    });
 }
 
 void QVncClient::Private::reset()
@@ -630,9 +639,11 @@ void QVncClient::Private::reset()
     state = ProtocolVersionState;
     q->setProtocolVersion(ProtocolVersionUnknown);
     q->setSecurityType(SecurityTypeUnknwon);
+    vncChallenge.clear();
+    fbu.active = false;
     frameBufferWidth = 0;
     frameBufferHeight = 0;
-    image = QImage(); // Clear the image buffer
+    image = QImage();
     emit q->framebufferSizeChanged(0, 0);
 }
 
@@ -642,12 +653,18 @@ void QVncClient::Private::reset()
 */
 void QVncClient::Private::read()
 {
+    if (reading)
+        return;
+    reading = true;
     switch (state) {
     case ProtocolVersionState:
         parseProtocolVersion();
         break;
     case SecurityState:
         parseSecurity();
+        break;
+    case VncAuthenticationState:
+        parseVncAuthentication();
         break;
     case SecurityResultState:
         parseSecurityResult();
@@ -662,6 +679,11 @@ void QVncClient::Private::read()
         qDebug() << socket->readAll();
         break;
     }
+    reading = false;
+    // Re-enter if there is buffered data we can still make progress on.
+    // Skip when waiting for more data mid-FBU to avoid a spin loop.
+    if (socket && socket->bytesAvailable() > 0 && !fbu.active)
+        QMetaObject::invokeMethod(q, [this]() { read(); }, Qt::QueuedConnection);
 }
 
 #ifdef USE_ZLIB
@@ -674,68 +696,56 @@ void QVncClient::Private::read()
     Tight encoding is a complex encoding that can use zlib compression, JPEG compression,
     or various subencodings for efficient representation of framebuffer data.
 */
-void QVncClient::Private::handleTightEncoding(const Rectangle &rect)
+bool QVncClient::Private::handleTightEncoding(const Rectangle &rect)
 {
-    // Read the compression control byte
-    quint8 compControl = 0;
-    if (socket->bytesAvailable() < 1) {
-        if (!socket->waitForReadyRead(1000)) {
-            qCWarning(lcVncClient) << "Timeout waiting for Tight compression control byte";
-            framebufferUpdateRequest();
-            return;
-        }
+    // Peek to determine total message size without consuming data
+    if (socket->bytesAvailable() < 1) return false;
+    const QByteArray peek = socket->peek(qMin(socket->bytesAvailable(), qint64(4)));
+    const quint8 compControl = static_cast<quint8>(peek.at(0));
+    const bool isJpeg = (compControl & 0x0F) == 0x09;
+
+    // Parse compact length from peek data at offset 1
+    auto parseCompactLength = [&](int offset, int *length) -> int {
+        // Returns total bytes used for length encoding, or 0 if not enough data
+        if (peek.size() <= offset) return 0;
+        quint8 b1 = static_cast<quint8>(peek.at(offset));
+        if (!(b1 & 0x80)) { *length = b1; return 1; }
+        if (peek.size() <= offset + 2) return 0;
+        quint8 b2 = static_cast<quint8>(peek.at(offset + 1));
+        quint8 b3 = static_cast<quint8>(peek.at(offset + 2));
+        *length = ((b1 & 0x7F) << 16) | (b2 << 8) | b3;
+        return 3;
+    };
+
+    // Calculate total bytes needed
+    int dataLength = 0;
+    int lenBytes = parseCompactLength(1, &dataLength);
+    if (lenBytes == 0) return false;
+    qint64 totalNeeded = 1 + lenBytes + dataLength;
+    if (socket->bytesAvailable() < totalNeeded) return false;
+
+    // All data available — consume
+    quint8 ctrl;
+    socket->read(reinterpret_cast<char*>(&ctrl), 1);
+
+    // Skip length bytes (already parsed)
+    socket->read(lenBytes);
+
+    if (isJpeg) {
+        if (!handleTightJpeg(rect, dataLength))
+            return true; // skip on error
+        return true;
     }
-    socket->read(reinterpret_cast<char*>(&compControl), 1);
-    
-    // Check for basic compression type
-    bool resetStream = (compControl & 0x80) != 0;
-    int streamId = compControl & 0x03;
-    
-    // Check for JPEG compression
-    if ((compControl & 0x0F) == 0x09) {
-        int length = 0;
-        quint8 lenByte = 0;
-        
-        // Read the JPEG data length
-        if (socket->bytesAvailable() < 1) {
-            if (!socket->waitForReadyRead(1000)) {
-                qCWarning(lcVncClient) << "Timeout waiting for JPEG length byte";
-                framebufferUpdateRequest();
-                return;
-            }
-        }
-        socket->read(reinterpret_cast<char*>(&lenByte), 1);
-        
-        if (lenByte & 0x80) {
-            // 3-byte length
-            quint8 lenMid, lenLow;
-            if (socket->bytesAvailable() < 2) {
-                socket->waitForReadyRead();
-            }
-            socket->read(reinterpret_cast<char*>(&lenMid), 1);
-            socket->read(reinterpret_cast<char*>(&lenLow), 1);
-            length = ((lenByte & 0x7F) << 16) | (lenMid << 8) | lenLow;
-        } else {
-            // 1-byte length
-            length = lenByte;
-        }
-        
-        // Handle JPEG compression
-        if (!handleTightJpeg(rect, length)) {
-            // If JPEG handling fails, request a new update
-            framebufferUpdateRequest();
-        }
-        return;
-    }
-    
-    // Non-JPEG compression
-    // Reset the zlib stream if requested
+
+    // Non-JPEG: zlib compressed
+    bool resetStream = (ctrl & 0x80) != 0;
+    int streamId = ctrl & 0x03;
+
     if (resetStream && tightData->zlibStreamActive[streamId]) {
         inflateEnd(&tightData->zlibStream[streamId]);
         tightData->zlibStreamActive[streamId] = false;
     }
-    
-    // Initialize stream if not active
+
     if (!tightData->zlibStreamActive[streamId]) {
         tightData->zlibStream[streamId].zalloc = Z_NULL;
         tightData->zlibStream[streamId].zfree = Z_NULL;
@@ -743,82 +753,36 @@ void QVncClient::Private::handleTightEncoding(const Rectangle &rect)
         inflateInit(&tightData->zlibStream[streamId]);
         tightData->zlibStreamActive[streamId] = true;
     }
-    
-    // Read the uncompressed length
-    int length = 0;
-    if ((compControl & 0x80) == 0) {
-        quint8 len;
-        if (socket->bytesAvailable() < 1) {
-            socket->waitForReadyRead();
-        }
-        socket->read(reinterpret_cast<char*>(&len), 1);
-        length = len;
-    } else {
-        quint8 lenHigh, lenMid, lenLow;
-        if (socket->bytesAvailable() < 3) {
-            socket->waitForReadyRead();
-        }
-        socket->read(reinterpret_cast<char*>(&lenHigh), 1);
-        socket->read(reinterpret_cast<char*>(&lenMid), 1);
-        socket->read(reinterpret_cast<char*>(&lenLow), 1);
-        length = (lenHigh << 16) | (lenMid << 8) | lenLow;
-    }
-    
-    // Read compressed data
-    QByteArray compressedData;
-    compressedData.resize(length);
-    
-    int totalRead = 0;
-    while (totalRead < length) {
-        if (socket->bytesAvailable() < 1 && totalRead < length) {
-            socket->waitForReadyRead();
-        }
-        int bytesRead = socket->read(compressedData.data() + totalRead, length - totalRead);
-        if (bytesRead <= 0) {
-            qCWarning(lcVncClient) << "Failed to read compressed data for Tight encoding";
-            framebufferUpdateRequest(); // Request a new frame
-            return;
-        }
-        totalRead += bytesRead;
-    }
-    
-    // Calculate expected uncompressed size
+
+    QByteArray compressedData = socket->read(dataLength);
+
     int expectedBytes = rect.w * rect.h * (pixelFormat.bitsPerPixel / 8);
-    
-    // Decompress data
     QByteArray uncompressedData = decompressTightData(streamId, compressedData, expectedBytes);
     if (uncompressedData.isEmpty()) {
-        qCWarning(lcVncClient) << "Failed to decompress Tight encoded data, requesting new update";
-        framebufferUpdateRequest(); // Request a new frame
-        return;
+        qCWarning(lcVncClient) << "Failed to decompress Tight encoded data";
+        return true; // skip
     }
-    
-    // Update the framebuffer with the decompressed data
+
     const unsigned char* data = reinterpret_cast<const unsigned char*>(uncompressedData.constData());
-    
     for (int y = 0; y < rect.h; y++) {
         for (int x = 0; x < rect.w; x++) {
             int offset = (y * rect.w + x) * (pixelFormat.bitsPerPixel / 8);
             quint32 color = 0;
-            
-            // Read pixel data according to bpp
-            if (pixelFormat.bitsPerPixel == 32) {
+            if (pixelFormat.bitsPerPixel == 32)
                 color = *reinterpret_cast<const quint32*>(data + offset);
-            } else if (pixelFormat.bitsPerPixel == 24) {
+            else if (pixelFormat.bitsPerPixel == 24)
                 color = data[offset] | (data[offset + 1] << 8) | (data[offset + 2] << 16);
-            } else if (pixelFormat.bitsPerPixel == 16) {
+            else if (pixelFormat.bitsPerPixel == 16)
                 color = *reinterpret_cast<const quint16*>(data + offset);
-            } else if (pixelFormat.bitsPerPixel == 8) {
+            else if (pixelFormat.bitsPerPixel == 8)
                 color = data[offset];
-            }
-            
-            // Convert to RGB and set pixel
             const auto r = (color >> pixelFormat.redShift) & pixelFormat.redMax;
             const auto g = (color >> pixelFormat.greenShift) & pixelFormat.greenMax;
             const auto b = (color >> pixelFormat.blueShift) & pixelFormat.blueMax;
             image.setPixel(rect.x + x, rect.y + y, qRgb(r, g, b));
         }
     }
+    return true;
 }
 #endif
 
@@ -832,21 +796,11 @@ void QVncClient::Private::handleTightEncoding(const Rectangle &rect)
 */
 bool QVncClient::Private::handleTightJpeg(const Rectangle &rect, int dataLength)
 {
-    // Read JPEG data
-    QByteArray jpegData;
-    jpegData.resize(dataLength);
-    
-    int totalRead = 0;
-    while (totalRead < dataLength) {
-        if (socket->bytesAvailable() < 1 && totalRead < dataLength) {
-            socket->waitForReadyRead();
-        }
-        int bytesRead = socket->read(jpegData.data() + totalRead, dataLength - totalRead);
-        if (bytesRead <= 0) {
-            qCWarning(lcVncClient) << "Failed to read JPEG data for Tight encoding";
-            return false;
-        }
-        totalRead += bytesRead;
+    // Read JPEG data (caller already ensured data is available)
+    QByteArray jpegData = socket->read(dataLength);
+    if (jpegData.size() < dataLength) {
+        qCWarning(lcVncClient) << "Failed to read JPEG data for Tight encoding";
+        return false;
     }
     
     // Decode JPEG image using Qt
@@ -1013,7 +967,9 @@ void QVncClient::Private::parseSecurity37()
         read(&securityType);
         securityTypes.append(securityType);
     }
-    if (securityTypes.contains(SecurityTypeNone))
+    if (securityTypes.contains(SecurityTypeVncAuthentication))
+        q->setSecurityType(SecurityTypeVncAuthentication);
+    else if (securityTypes.contains(SecurityTypeNone))
         q->setSecurityType(SecurityTypeNone);
     else
         q->setSecurityType(SecurityTypeInvalid);
@@ -1053,6 +1009,21 @@ void QVncClient::Private::securityTypeChanged(SecurityType securityType)
             break;
         }
         break;
+    case SecurityTypeVncAuthentication:
+        switch (protocolVersion) {
+        case ProtocolVersion33:
+            state = VncAuthenticationState;
+            parseVncAuthentication();  // challenge may already be buffered
+            break;
+        case ProtocolVersion37:
+        case ProtocolVersion38:
+            write(securityType);  // send 1-byte type selection
+            state = VncAuthenticationState;
+            break;
+        default:
+            break;
+        }
+        break;
     default:
         qCWarning(lcVncClient) << "Security type" << securityType << "not supported";
         break;
@@ -1080,24 +1051,73 @@ void QVncClient::Private::parseSecurityReason()
 
 /*!
     \internal
-    Parses the security result message sent by the server in RFB 3.8.
+    Parses the 16-byte VNC authentication challenge from the server.
 
-    The server sends a 4-byte status code: 0 indicates success, any other value
-    indicates failure followed by a reason string.
+    If no password is set, stores the challenge and emits passwordRequested()
+    to allow the application to supply a password later via setPassword().
+*/
+void QVncClient::Private::parseVncAuthentication()
+{
+    if (socket->bytesAvailable() < 16)
+        return;
+    vncChallenge = socket->read(16);
+    if (password.isEmpty()) {
+        emit q->passwordRequested();
+        return;
+    }
+    sendVncAuthResponse();
+}
+
+/*!
+    \internal
+    Encrypts the stored VNC challenge with the password and sends the response.
+
+    After sending, transitions to the appropriate next state based on protocol version:
+    - 3.3: directly to ClientInit (no SecurityResult in 3.3)
+    - 3.7/3.8: to SecurityResultState
+*/
+void QVncClient::Private::sendVncAuthResponse()
+{
+    const QByteArray response = vncEncryptChallenge(password, vncChallenge);
+    if (isValid())
+        socket->write(response);
+    vncChallenge.clear();
+
+    switch (protocolVersion) {
+    case ProtocolVersion33:
+        state = ClientInitState;
+        clientInit();
+        break;
+    case ProtocolVersion37:
+    case ProtocolVersion38:
+        state = SecurityResultState;
+        break;
+    default:
+        break;
+    }
+}
+
+/*!
+    \internal
+    Parses the SecurityResult message (u32) sent after authentication.
+
+    Result 0 means success (proceed to ClientInit).
+    Non-zero means failure; protocol 3.8 includes a reason string.
 */
 void QVncClient::Private::parseSecurityResult()
 {
-    if (socket->bytesAvailable() < 4) {
-        qCDebug(lcVncClient) << "Waiting for security result:" << socket->peek(4);
+    if (socket->bytesAvailable() < 4)
         return;
-    }
     quint32_be result;
     read(&result);
     if (result == 0) {
         state = ClientInitState;
         clientInit();
     } else {
-        parseSecurityReason();
+        qCWarning(lcVncClient) << "VNC authentication failed";
+        if (protocolVersion == ProtocolVersion38)
+            parseSecurityReason();
+        // Server will close the connection
     }
 }
 
@@ -1164,12 +1184,12 @@ void QVncClient::Private::parserServerInit()
     
     // Set supported encodings based on available libraries
     const QList<qint32> encodings {
-        RawEncoding,
         Hextile,
         ZRLE,
 #ifdef USE_ZLIB
         Tight,
 #endif
+        RawEncoding,
     };
     setEncodings(encodings);
     framebufferUpdateRequest(false);
@@ -1238,6 +1258,10 @@ void QVncClient::Private::framebufferUpdateRequest(bool incremental, const QRect
 */
 void QVncClient::Private::parseServerMessages()
 {
+    if (fbu.active) {
+        processFramebufferRects();
+        return;
+    }
     if (socket->bytesAvailable() < 1) return;
     quint8 messageType = 0;
     read(&messageType);
@@ -1258,41 +1282,61 @@ void QVncClient::Private::parseServerMessages()
 */
 void QVncClient::Private::framebufferUpdate()
 {
-    while (socket->bytesAvailable() < 3)
-        socket->waitForReadyRead();
+    if (socket->bytesAvailable() < 3) return;
     socket->read(1); // padding
     quint16_be numberOfRectangles;
     read(&numberOfRectangles);
-    for (int i = 0; i < numberOfRectangles; i++) {
-        while (socket->bytesAvailable() < 12)
-            socket->waitForReadyRead();
-        Rectangle rect;
-        read(&rect);
-        qint32_be encodingType;
-        read(&encodingType);
+    fbu.totalRects = numberOfRectangles;
+    fbu.currentRect = 0;
+    fbu.active = true;
+    fbu.rectHeaderRead = false;
+    qCDebug(lcVncClient) << "FramebufferUpdate: rectangles:" << fbu.totalRects;
+    processFramebufferRects();
+}
 
-        switch (static_cast<int>(encodingType)) {
-            case ZRLE:
-                handleZRLEEncoding(rect);
-                break;
-#ifdef USE_ZLIB
-            case Tight:
-                handleTightEncoding(rect);
-                break;
-#endif
-            case Hextile:
-                handleHextileEncoding(rect);
-                break;
-            case RawEncoding:
-                handleRawEncoding(rect);
-                break;
-            default:
-                qCWarning(lcVncClient) << "Unsupported encoding:" << encodingType;
-                // Skip this rectangle as we don't understand the encoding
-                continue; // Use continue instead of return to process remaining rectangles
+void QVncClient::Private::processFramebufferRects()
+{
+    while (fbu.currentRect < fbu.totalRects) {
+        if (!fbu.rectHeaderRead) {
+            if (socket->bytesAvailable() < 12) return;
+            read(&fbu.rect);
+            qint32_be encodingType;
+            read(&encodingType);
+            fbu.encoding = encodingType;
+            fbu.rectHeaderRead = true;
+            fbu.hextileTX = 0;
+            fbu.hextileTY = 0;
         }
-        emit q->imageChanged(QRect(rect.x, rect.y, rect.w, rect.h));
+
+        bool ok = false;
+        switch (fbu.encoding) {
+        case ZRLE:
+            ok = handleZRLEEncoding(fbu.rect);
+            break;
+#ifdef USE_ZLIB
+        case Tight:
+            ok = handleTightEncoding(fbu.rect);
+            break;
+#endif
+        case Hextile:
+            ok = handleHextileEncoding(fbu.rect);
+            break;
+        case RawEncoding:
+            ok = handleRawEncoding(fbu.rect);
+            break;
+        default:
+            qCWarning(lcVncClient) << "Unsupported encoding:" << fbu.encoding;
+            ok = true; // skip
+            break;
+        }
+
+        if (!ok) return; // not enough data, will resume on next readyRead
+
+        emit q->imageChanged(QRect(fbu.rect.x, fbu.rect.y, fbu.rect.w, fbu.rect.h));
+        fbu.rectHeaderRead = false;
+        fbu.currentRect++;
     }
+    fbu.active = false;
     framebufferUpdateRequest();
 }
 
@@ -1304,12 +1348,12 @@ void QVncClient::Private::framebufferUpdate()
     
     Raw encoding sends uncompressed pixel data for each pixel in the rectangle.
 */
-void QVncClient::Private::handleRawEncoding(const Rectangle &rect)
+bool QVncClient::Private::handleRawEncoding(const Rectangle &rect)
 {
-    while (socket->bytesAvailable() < rect.w * rect.h * pixelFormat.bitsPerPixel / 8) {
-        socket->waitForReadyRead();
-    }
-    
+    const qint64 needed = static_cast<qint64>(rect.w) * rect.h * pixelFormat.bitsPerPixel / 8;
+    if (socket->bytesAvailable() < needed)
+        return false;
+
     for (int y = 0; y < rect.h; y++) {
         for (int x = 0; x < rect.w; x++) {
             switch (pixelFormat.bitsPerPixel) {
@@ -1323,13 +1367,11 @@ void QVncClient::Private::handleRawEncoding(const Rectangle &rect)
                 break; }
             default:
                 qCWarning(lcVncClient) << pixelFormat.bitsPerPixel << "bits per pixel not supported";
-                // Skip this pixel format as we don't support it
-                return;
+                return true; // skip
             }
         }
-        emit q->imageChanged(QRect(rect.x, rect.y, rect.w, rect.h));
     }
-    framebufferUpdateRequest();
+    return true;
 }
 
 /*!
@@ -1341,30 +1383,51 @@ void QVncClient::Private::handleRawEncoding(const Rectangle &rect)
     Hextile encoding divides the rectangle into 16x16 tiles, each with its own
     subencoding that can include background colors, foreground colors, and subrectangles.
 */
-void QVncClient::Private::handleHextileEncoding(const Rectangle &rect)
+bool QVncClient::Private::handleHextileEncoding(const Rectangle &rect)
 {
     const int tileWidth = 16;
     const int tileHeight = 16;
-    
-    quint32 backgroundColor = 0;
-    quint32 foregroundColor = 0;
-    
-    // Process the rectangle tile by tile
-    for (int ty = 0; ty < rect.h; ty += tileHeight) {
+    const int bpp = pixelFormat.bitsPerPixel / 8;
+
+    quint32 &backgroundColor = fbu.hextileBG;
+    quint32 &foregroundColor = fbu.hextileFG;
+
+    for (int &ty = fbu.hextileTY; ty < rect.h; ty += tileHeight) {
         const int th = qMin(tileHeight, rect.h - ty);
-        
-        for (int tx = 0; tx < rect.w; tx += tileWidth) {
+
+        for (int &tx = fbu.hextileTX; tx < rect.w; tx += tileWidth) {
             const int tw = qMin(tileWidth, rect.w - tx);
-            
-            // Read the subencoding mask
-            quint8 subencoding;
-            read(&subencoding);
-            
-            // If raw bit is set, the tile is sent in raw encoding
-            if (subencoding & HextileSubencoding::RawSubencoding) {
+
+            // Peek at subencoding to calculate tile data size before consuming
+            if (socket->bytesAvailable() < 1) return false;
+            const QByteArray peek = socket->peek(qMin(socket->bytesAvailable(), qint64(2048)));
+            const quint8 subencoding = static_cast<quint8>(peek.at(0));
+
+            qint64 tileBytes = 1; // subencoding byte
+            if (subencoding & RawSubencoding) {
+                tileBytes += tw * th * bpp;
+            } else {
+                if (subencoding & BackgroundSpecified) tileBytes += bpp;
+                if (subencoding & AnySubrects) {
+                    if (subencoding & ForegroundSpecified) tileBytes += bpp;
+                    tileBytes += 1; // numSubrects byte
+                    if (peek.size() < tileBytes) return false;
+                    const quint8 numSubrects = static_cast<quint8>(peek.at(tileBytes - 1));
+                    const int subrectSize = (subencoding & SubrectsColoured) ? bpp + 2 : 2;
+                    tileBytes += numSubrects * subrectSize;
+                }
+            }
+
+            if (socket->bytesAvailable() < tileBytes) return false;
+
+            // All tile data available — consume and process
+            quint8 sub;
+            read(&sub);
+
+            if (sub & RawSubencoding) {
                 for (int y = 0; y < th; y++) {
                     for (int x = 0; x < tw; x++) {
-                        if (pixelFormat.bitsPerPixel == 32) {
+                        if (bpp == 4) {
                             quint32_le color;
                             read(&color);
                             const auto r = (color >> pixelFormat.redShift) & pixelFormat.redMax;
@@ -1376,17 +1439,15 @@ void QVncClient::Private::handleHextileEncoding(const Rectangle &rect)
                 }
                 continue;
             }
-            
-            // Background specified
-            if (subencoding & HextileSubencoding::BackgroundSpecified) {
-                if (pixelFormat.bitsPerPixel == 32) {
+
+            if (sub & BackgroundSpecified) {
+                if (bpp == 4) {
                     quint32_le bg;
                     read(&bg);
                     backgroundColor = bg;
                 }
             }
-            
-            // Fill the background
+
             for (int y = 0; y < th; y++) {
                 for (int x = 0; x < tw; x++) {
                     const auto r = (backgroundColor >> pixelFormat.redShift) & pixelFormat.redMax;
@@ -1395,46 +1456,37 @@ void QVncClient::Private::handleHextileEncoding(const Rectangle &rect)
                     image.setPixel(rect.x + tx + x, rect.y + ty + y, qRgb(r, g, b));
                 }
             }
-            
-            // Foreground specified & any subrects
-            if (subencoding & HextileSubencoding::AnySubrects) {
-                // Foreground color specified
-                if (subencoding & HextileSubencoding::ForegroundSpecified) {
-                    if (pixelFormat.bitsPerPixel == 32) {
+
+            if (sub & AnySubrects) {
+                if (sub & ForegroundSpecified) {
+                    if (bpp == 4) {
                         quint32_le fg;
                         read(&fg);
                         foregroundColor = fg;
                     }
                 }
-                
-                // Read number of subrectangles
+
                 quint8 numSubrects;
                 read(&numSubrects);
-                
-                // Process each subrectangle
+
                 for (int i = 0; i < numSubrects; i++) {
                     quint32 color = foregroundColor;
-                    
-                    // If colored subrects, read the color
-                    if (subencoding & HextileSubencoding::SubrectsColoured) {
-                        if (pixelFormat.bitsPerPixel == 32) {
+                    if (sub & SubrectsColoured) {
+                        if (bpp == 4) {
                             quint32_le c;
                             read(&c);
                             color = c;
                         }
                     }
-                    
-                    // Read subrect position and size (x, y, w, h)
                     quint8 xy, wh;
                     read(&xy);
                     read(&wh);
-                    
+
                     const int sx = (xy >> 4) & 0xf;
                     const int sy = xy & 0xf;
                     const int sw = ((wh >> 4) & 0xf) + 1;
                     const int sh = (wh & 0xf) + 1;
-                    
-                    // Draw the subrectangle
+
                     for (int y = 0; y < sh && sy + y < th; y++) {
                         for (int x = 0; x < sw && sx + x < tw; x++) {
                             const auto r = (color >> pixelFormat.redShift) & pixelFormat.redMax;
@@ -1446,7 +1498,10 @@ void QVncClient::Private::handleHextileEncoding(const Rectangle &rect)
                 }
             }
         }
+        fbu.hextileTX = 0;
     }
+    fbu.hextileTY = 0;
+    return true;
 }
 
 /*!
@@ -1458,36 +1513,32 @@ void QVncClient::Private::handleHextileEncoding(const Rectangle &rect)
     ZRLE (Zlib Run-Length Encoding) compresses the pixel data using zlib and
     uses various subencodings for efficient representation.
 */
-void QVncClient::Private::handleZRLEEncoding(const Rectangle &rect)
+bool QVncClient::Private::handleZRLEEncoding(const Rectangle &rect)
 {
-    // First read the length of the zlib-compressed data
-    if (socket->bytesAvailable() < 4) return;
+    // Peek at the 4-byte length prefix to check total availability
+    if (socket->bytesAvailable() < 4) return false;
+    const QByteArray lenPeek = socket->peek(4);
     quint32_be zlibDataLength;
-    read(&zlibDataLength);
+    memcpy(&zlibDataLength, lenPeek.constData(), 4);
 
-    if (zlibDataLength == 0)
-        return; // No data for this rectangle
-
-    // Read the compressed data
-    if (socket->bytesAvailable() < zlibDataLength) {
-        // Wait for more data
-        while (socket->bytesAvailable() < zlibDataLength) {
-            if (!socket->waitForReadyRead(5000)) {
-                qCWarning(lcVncClient) << "Timeout waiting for ZRLE data";
-                break; // Break out but don't return - allows more frames to be processed
-            }
-        }
+    if (zlibDataLength == 0) {
+        socket->read(4); // consume the length
+        return true;
     }
+
+    if (socket->bytesAvailable() < 4 + static_cast<qint64>(zlibDataLength))
+        return false;
+
+    // All data available — consume
+    read(&zlibDataLength);
     
     QByteArray compressedData = socket->read(zlibDataLength);
     
     // Use Qt's own QByteArray-based zlib decompression
     QByteArray uncompressedData = qUncompress(compressedData);
     if (uncompressedData.isEmpty()) {
-        qCWarning(lcVncClient) << "Failed to decompress ZRLE data, requesting new update";
-        // Request a new frame instead of returning
-        framebufferUpdateRequest();
-        return;
+        qCWarning(lcVncClient) << "Failed to decompress ZRLE data";
+        return true; // skip
     }
     
     // Process the decompressed data
@@ -1511,7 +1562,7 @@ void QVncClient::Private::handleZRLEEncoding(const Rectangle &rect)
             // 0=raw, 1=solid, 2=packed palette, 3=RLE palette, 8-127=plain RLE
             if (dataOffset >= uncompressedData.size()) {
                 qCWarning(lcVncClient) << "ZRLE data truncated (subencoding)";
-                return;
+                return true; // skip
             }
             
             quint8 subencoding = static_cast<quint8>(uncompressedData.at(dataOffset++));
@@ -1688,6 +1739,7 @@ void QVncClient::Private::handleZRLEEncoding(const Rectangle &rect)
             }
         }
     }
+    return true;
 }
 
 /*!
@@ -1872,6 +1924,31 @@ int QVncClient::framebufferHeight() const
 QImage QVncClient::image() const
 {
     return d->image;
+}
+
+/*!
+    Returns the password used for VNC authentication.
+
+    \sa setPassword(), passwordChanged()
+*/
+QString QVncClient::password() const
+{
+    return d->password;
+}
+
+/*!
+    Sets the password to \a password for VNC authentication.
+
+    If the server has already sent a challenge and no password was
+    previously set, the authentication response is sent immediately.
+
+    \sa password(), passwordChanged(), passwordRequested()
+*/
+void QVncClient::setPassword(const QString &password)
+{
+    if (d->password == password) return;
+    d->password = password;
+    emit passwordChanged(password);
 }
 
 /*!
