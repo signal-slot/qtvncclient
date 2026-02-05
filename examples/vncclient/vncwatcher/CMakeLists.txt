@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only
 
 cmake_minimum_required(VERSION 3.16)
-project(mcp-vnc LANGUAGES CXX)
+project(vnc-watcher LANGUAGES CXX)
 
 set(CMAKE_INCLUDE_CURRENT_DIR ON)
 
@@ -10,35 +10,36 @@ if(NOT DEFINED INSTALL_EXAMPLESDIR)
     set(INSTALL_EXAMPLESDIR "examples")
 endif()
 
-set(INSTALL_EXAMPLEDIR "${INSTALL_EXAMPLESDIR}/qtvncclient/mcp-vnc")
+set(INSTALL_EXAMPLEDIR "${INSTALL_EXAMPLESDIR}/qtvncclient/vnc-watcher")
 
-find_package(Qt6 REQUIRED COMPONENTS Core Network Widgets VncClient McpServer)
+find_package(Qt6 REQUIRED COMPONENTS Widgets VncClient)
 
 qt_standard_project_setup()
 
-qt_add_executable(mcp-vnc
+qt_add_executable(vnc-watcher
     main.cpp
-    tools.h tools.cpp
-    vncwidget.h vncwidget.cpp
+    mainwindow.cpp
+    mainwindow.h
+    mainwindow.ui
+    spinbox.cpp
+    spinbox.h
+    vncwidget.cpp
+    vncwidget.h
 )
 
-set_target_properties(mcp-vnc PROPERTIES
+set_target_properties(vnc-watcher PROPERTIES
     WIN32_EXECUTABLE FALSE
-    MACOSX_BUNDLE FALSE
-    CXX_STANDARD 20
-    CXX_STANDARD_REQUIRED ON
+    MACOSX_BUNDLE TRUE
 )
 
-target_link_libraries(mcp-vnc PRIVATE
-    Qt::Core
-    Qt::Network
-    Qt::Widgets
+target_link_libraries(vnc-watcher PRIVATE
     Qt::VncClient
-    Qt::McpServer
+    Qt::Widgets
 )
 
-install(TARGETS mcp-vnc
+install(TARGETS vnc-watcher
     RUNTIME DESTINATION "${INSTALL_EXAMPLEDIR}"
     BUNDLE DESTINATION "${INSTALL_EXAMPLEDIR}"
     LIBRARY DESTINATION "${INSTALL_EXAMPLEDIR}"
 )
+
