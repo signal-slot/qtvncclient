@@ -1360,11 +1360,11 @@ void QVncClient::Private::parserServerInit()
     
     // Set supported encodings based on available libraries
     const QList<qint32> encodings {
-        Hextile,
-        ZRLE,
 #ifdef USE_ZLIB
         Tight,
 #endif
+        ZRLE,
+        Hextile,
         RawEncoding,
     };
     setEncodings(encodings);
