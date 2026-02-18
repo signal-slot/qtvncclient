@@ -243,6 +243,8 @@ public:
     */
     void pointerEvent(QMouseEvent *e);
 
+    void restartFramebufferUpdates();
+
 private:
     void reset();
 
@@ -545,6 +547,7 @@ public:
     QImage image;                               ///< Image containing the framebuffer
     int frameBufferWidth = 0;                   ///< Framebuffer width
     int frameBufferHeight = 0;                  ///< Framebuffer height
+    bool framebufferUpdatesEnabled = true;      ///< Controls automatic FramebufferUpdateRequests
 };
 
 /*!
@@ -1368,7 +1371,8 @@ void QVncClient::Private::parserServerInit()
         RawEncoding,
     };
     setEncodings(encodings);
-    framebufferUpdateRequest(false);
+    if (framebufferUpdatesEnabled)
+        framebufferUpdateRequest(false);
 }
 
 /*!
@@ -1513,7 +1517,15 @@ void QVncClient::Private::processFramebufferRects()
         fbu.currentRect++;
     }
     fbu.active = false;
-    framebufferUpdateRequest();
+    emit q->framebufferUpdated();
+    if (framebufferUpdatesEnabled)
+        framebufferUpdateRequest();
+}
+
+void QVncClient::Private::restartFramebufferUpdates()
+{
+    if (state == WaitingState && !fbu.active)
+        framebufferUpdateRequest(false);
 }
 
 /*!
@@ -2131,6 +2143,21 @@ void QVncClient::setPassword(const QString &password)
     if (d->password == password) return;
     d->password = password;
     emit passwordChanged(password);
+}
+
+bool QVncClient::framebufferUpdatesEnabled() const
+{
+    return d->framebufferUpdatesEnabled;
+}
+
+void QVncClient::setFramebufferUpdatesEnabled(bool enabled)
+{
+    if (d->framebufferUpdatesEnabled == enabled)
+        return;
+    d->framebufferUpdatesEnabled = enabled;
+    emit framebufferUpdatesEnabledChanged(enabled);
+    if (enabled)
+        d->restartFramebufferUpdates();
 }
 
 /*!
