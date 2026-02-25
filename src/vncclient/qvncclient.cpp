@@ -121,6 +121,9 @@ public:
 #ifdef USE_ZLIB
         Tight = 7,       ///< Tight encoding (with zlib compression and JPEG)
 #endif
+        // Pseudo-encodings (negative values per RFB spec)
+        CursorPseudoEncoding = -239,    ///< RichCursor: server sends cursor shape
+        CursorPosPseudoEncoding = -232, ///< CursorPos: server sends cursor position
     };
     
     /*!
@@ -511,6 +514,9 @@ private:
     */
     bool handleZRLEEncoding(const Rectangle &rect);
 
+    bool handleRichCursorEncoding(const Rectangle &rect);
+    bool handleCursorPosEncoding(const Rectangle &rect);
+
 private:
     QVncClient *q;                              ///< Pointer to the public class
     QTcpSocket *prev = nullptr;                 ///< Previous socket for cleanup
@@ -548,6 +554,11 @@ public:
     int frameBufferWidth = 0;                   ///< Framebuffer width
     int frameBufferHeight = 0;                  ///< Framebuffer height
     bool framebufferUpdatesEnabled = true;      ///< Controls automatic FramebufferUpdateRequests
+
+    // Cursor state (from pseudo-encodings)
+    QImage cursorImage;                         ///< Cursor shape with alpha from bitmask
+    QPoint cursorHotspot;                       ///< Hotspot within cursor image
+    QPoint cursorPos;                           ///< Last known cursor position from server
 };
 
 /*!
@@ -649,6 +660,9 @@ void QVncClient::Private::reset()
     frameBufferWidth = 0;
     frameBufferHeight = 0;
     image = QImage();
+    cursorImage = QImage();
+    cursorHotspot = QPoint();
+    cursorPos = QPoint();
 #ifdef USE_ZLIB
     if (zrleStreamActive) { inflateEnd(&zrleStream); zrleStreamActive = false; }
 #endif
@@ -1369,6 +1383,8 @@ void QVncClient::Private::parserServerInit()
         ZRLE,
         Hextile,
         RawEncoding,
+        CursorPseudoEncoding,
+        CursorPosPseudoEncoding,
     };
     setEncodings(encodings);
     if (framebufferUpdatesEnabled)
@@ -1489,6 +1505,7 @@ void QVncClient::Private::processFramebufferRects()
         }
 
         bool ok = false;
+        bool isPseudoEncoding = false;
         switch (fbu.encoding) {
         case ZRLE:
             ok = handleZRLEEncoding(fbu.rect);
@@ -1504,6 +1521,14 @@ void QVncClient::Private::processFramebufferRects()
         case RawEncoding:
             ok = handleRawEncoding(fbu.rect);
             break;
+        case CursorPseudoEncoding:
+            ok = handleRichCursorEncoding(fbu.rect);
+            isPseudoEncoding = true;
+            break;
+        case CursorPosPseudoEncoding:
+            ok = handleCursorPosEncoding(fbu.rect);
+            isPseudoEncoding = true;
+            break;
         default:
             qCWarning(lcVncClient) << "Unsupported encoding:" << fbu.encoding;
             ok = true; // skip
@@ -1512,7 +1537,8 @@ void QVncClient::Private::processFramebufferRects()
 
         if (!ok) return; // not enough data, will resume on next readyRead
 
-        emit q->imageChanged(QRect(fbu.rect.x, fbu.rect.y, fbu.rect.w, fbu.rect.h));
+        if (!isPseudoEncoding)
+            emit q->imageChanged(QRect(fbu.rect.x, fbu.rect.y, fbu.rect.w, fbu.rect.h));
         fbu.rectHeaderRead = false;
         fbu.currentRect++;
     }
@@ -1520,6 +1546,89 @@ void QVncClient::Private::processFramebufferRects()
     emit q->framebufferUpdated();
     if (framebufferUpdatesEnabled)
         framebufferUpdateRequest();
+}
+
+/*!
+    \internal
+    Handles RichCursor pseudo-encoding (-239).
+
+    The server sends the cursor shape as pixel data plus a bitmask.
+    Rect header fields: x=hotspotX, y=hotspotY, w=cursorWidth, h=cursorHeight.
+*/
+bool QVncClient::Private::handleRichCursorEncoding(const Rectangle &rect)
+{
+    const int w = rect.w;
+    const int h = rect.h;
+
+    // Empty cursor (invisible)
+    if (w == 0 || h == 0) {
+        cursorImage = QImage();
+        cursorHotspot = QPoint(rect.x, rect.y);
+        emit q->cursorChanged();
+        return true;
+    }
+
+    const int bpp = pixelFormat.bitsPerPixel / 8;
+    const qint64 pixelDataSize = static_cast<qint64>(w) * h * bpp;
+    const int maskRowBytes = (w + 7) / 8;
+    const qint64 maskSize = static_cast<qint64>(maskRowBytes) * h;
+    const qint64 totalNeeded = pixelDataSize + maskSize;
+
+    if (socket->bytesAvailable() < totalNeeded)
+        return false;
+
+    const QByteArray pixelData = socket->read(pixelDataSize);
+    const QByteArray maskData = socket->read(maskSize);
+
+    QImage cursor(w, h, QImage::Format_ARGB32);
+    cursor.fill(Qt::transparent);
+
+    int pixelOffset = 0;
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            // Check bitmask (MSB first within each byte)
+            const int maskByteIndex = y * maskRowBytes + (x / 8);
+            const int maskBit = 7 - (x % 8);
+            const bool visible = (maskData.at(maskByteIndex) >> maskBit) & 1;
+
+            if (visible) {
+                // Decode pixel using current pixelFormat (same as handleRawEncoding)
+                switch (bpp) {
+                case 4: {
+                    quint32 color;
+                    memcpy(&color, pixelData.constData() + pixelOffset, 4);
+                    const auto r = (color >> pixelFormat.redShift) & pixelFormat.redMax;
+                    const auto g = (color >> pixelFormat.greenShift) & pixelFormat.greenMax;
+                    const auto b = (color >> pixelFormat.blueShift) & pixelFormat.blueMax;
+                    cursor.setPixel(x, y, qRgba(r, g, b, 255));
+                    break;
+                }
+                default:
+                    break;
+                }
+            }
+            pixelOffset += bpp;
+        }
+    }
+
+    cursorImage = cursor;
+    cursorHotspot = QPoint(rect.x, rect.y);
+    emit q->cursorChanged();
+    return true;
+}
+
+/*!
+    \internal
+    Handles CursorPos pseudo-encoding (-232).
+
+    The server sends the current cursor position in the rect header fields.
+    No additional data follows.
+*/
+bool QVncClient::Private::handleCursorPosEncoding(const Rectangle &rect)
+{
+    cursorPos = QPoint(rect.x, rect.y);
+    emit q->cursorPosChanged(cursorPos);
+    return true;
 }
 
 void QVncClient::Private::restartFramebufferUpdates()
@@ -2118,6 +2227,38 @@ int QVncClient::framebufferHeight() const
 QImage QVncClient::image() const
 {
     return d->image;
+}
+
+/*!
+    Returns the cursor image received from the server via RichCursor pseudo-encoding.
+    The image has Format_ARGB32 with transparent pixels where the bitmask is 0.
+    Returns a null QImage if no cursor data has been received.
+
+    \sa cursorHotspot(), cursorChanged()
+*/
+QImage QVncClient::cursorImage() const
+{
+    return d->cursorImage;
+}
+
+/*!
+    Returns the cursor hotspot within the cursor image.
+
+    \sa cursorImage(), cursorChanged()
+*/
+QPoint QVncClient::cursorHotspot() const
+{
+    return d->cursorHotspot;
+}
+
+/*!
+    Returns the last known cursor position from the server via CursorPos pseudo-encoding.
+
+    \sa cursorPosChanged()
+*/
+QPoint QVncClient::cursorPos() const
+{
+    return d->cursorPos;
 }
 
 /*!

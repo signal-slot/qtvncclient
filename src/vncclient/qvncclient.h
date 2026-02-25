@@ -63,6 +63,11 @@ public:
     QImage image() const;
     QString password() const;
 
+    // Cursor data from RichCursor/CursorPos pseudo-encodings
+    QImage cursorImage() const;
+    QPoint cursorHotspot() const;
+    QPoint cursorPos() const;
+
     // Process input events
     void handleKeyEvent(QKeyEvent *e);
     void handlePointerEvent(QMouseEvent *e);
@@ -87,6 +92,8 @@ signals:
     void passwordRequested();
     void framebufferUpdatesEnabledChanged(bool enabled);
     void framebufferUpdated();
+    void cursorChanged();
+    void cursorPosChanged(const QPoint &pos);
 
 private:
     class Private;
