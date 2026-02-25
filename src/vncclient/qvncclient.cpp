@@ -614,7 +614,7 @@ QVncClient::Private::Private(QVncClient *parent)
                 q->setSecurityType(SecurityTypeUnknwon);
                 read();
             });
-            connect(socket, &QTcpSocket::disconnected, q, [this, socket]() {
+            connect(socket, &QTcpSocket::disconnected, q, [this]() {
                 qCInfo(lcVncClient) << "Disconnected from VNC server";
                 emit q->connectionStateChanged(false);
                 
