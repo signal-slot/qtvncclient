@@ -77,6 +77,7 @@ public slots:
     void setPassword(const QString &password);
     void setFramebufferUpdatesEnabled(bool enabled);
     void sendClipboardText(const QString &text);
+    void sendClipboardImage(const QImage &image);
 
 private:
     void setProtocolVersion(ProtocolVersion protocolVersion);
@@ -96,6 +97,7 @@ signals:
     void cursorChanged();
     void cursorPosChanged(const QPoint &pos);
     void clipboardTextReceived(const QString &text);
+    void clipboardImageReceived(const QImage &image);
 
 private:
     class Private;

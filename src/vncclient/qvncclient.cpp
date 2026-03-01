@@ -592,6 +592,7 @@ public:
     QPoint cursorPos;                           ///< Last known cursor position from server
 
     void clientCutText(const QString &text);
+    void clientCutImage(const QImage &image);
 
 #ifdef USE_ZLIB
     bool extendedClipboard = false;
@@ -602,6 +603,7 @@ public:
     z_stream clipboardDeflateStream;
     bool clipboardDeflateActive = false;
     QString pendingClipboardText;
+    QImage pendingClipboardImage;
 #endif
 };
 
@@ -715,6 +717,7 @@ void QVncClient::Private::reset()
     remoteClipboardCaps = 0;
     remoteClipboardSizes.clear();
     pendingClipboardText.clear();
+    pendingClipboardImage = QImage();
 #endif
     emit q->framebufferSizeChanged(0, 0);
 }
@@ -1577,6 +1580,19 @@ void QVncClient::Private::clientCutText(const QString &text)
     socket->write(data);
 }
 
+void QVncClient::Private::clientCutImage(const QImage &image)
+{
+#ifdef USE_ZLIB
+    if (!socket || image.isNull()) return;
+    if (extendedClipboard) {
+        pendingClipboardImage = image;
+        sendExtendedClipboardNotify(ClipboardDib);
+    }
+#else
+    Q_UNUSED(image);
+#endif
+}
+
 #ifdef USE_ZLIB
 void QVncClient::Private::sendExtendedClipboardMessage(const QByteArray &payload)
 {
@@ -1592,8 +1608,9 @@ void QVncClient::Private::sendExtendedClipboardMessage(const QByteArray &payload
 
 void QVncClient::Private::sendExtendedClipboardCaps()
 {
-    // Declare: we support text format, and caps/request/peek/notify/provide actions
+    // Declare: we support text and DIB formats, and caps/request/peek/notify/provide actions
     const quint32 flags = ClipboardText
+                        | ClipboardDib
                         | ClipboardCaps
                         | ClipboardRequest
                         | ClipboardPeek
@@ -1601,10 +1618,12 @@ void QVncClient::Private::sendExtendedClipboardCaps()
                         | ClipboardProvide;
 
     QByteArray payload;
-    payload.resize(4 + 4); // flags + one size entry for text format
+    payload.resize(4 + 4 + 4); // flags + size for text + size for DIB
     qToBigEndian<quint32>(flags, payload.data());
     // Max size for text format (0 = force notify/request/provide flow)
     qToBigEndian<quint32>(0, payload.data() + 4);
+    // Max size for DIB format (0 = force notify/request/provide flow)
+    qToBigEndian<quint32>(0, payload.data() + 8);
     sendExtendedClipboardMessage(payload);
 }
 
@@ -1673,6 +1692,94 @@ void QVncClient::Private::sendExtendedClipboardProvide(quint32 formats, const QM
     sendExtendedClipboardMessage(payload);
 }
 
+static QByteArray imageToDib(const QImage &image)
+{
+    const QImage argb = image.convertToFormat(QImage::Format_ARGB32);
+    const int w = argb.width();
+    const int h = argb.height();
+
+    // 40-byte BITMAPINFOHEADER + BGRA pixel data
+    QByteArray dib;
+    dib.resize(40 + w * h * 4);
+    char *p = dib.data();
+
+    // BITMAPINFOHEADER
+    qToLittleEndian<quint32>(40, p);           // biSize
+    qToLittleEndian<qint32>(w, p + 4);         // biWidth
+    qToLittleEndian<qint32>(-h, p + 8);        // biHeight (negative = top-down)
+    qToLittleEndian<quint16>(1, p + 12);       // biPlanes
+    qToLittleEndian<quint16>(32, p + 14);      // biBitCount
+    qToLittleEndian<quint32>(0, p + 16);       // biCompression (BI_RGB)
+    qToLittleEndian<quint32>(w * h * 4, p + 20); // biSizeImage
+    qToLittleEndian<qint32>(0, p + 24);        // biXPelsPerMeter
+    qToLittleEndian<qint32>(0, p + 28);        // biYPelsPerMeter
+    qToLittleEndian<quint32>(0, p + 32);       // biClrUsed
+    qToLittleEndian<quint32>(0, p + 36);       // biClrImportant
+
+    // Pixel data: QImage ARGB32 stores 0xAARRGGBB, DIB expects BGRA byte order
+    char *dst = p + 40;
+    for (int y = 0; y < h; ++y) {
+        const QRgb *src = reinterpret_cast<const QRgb *>(argb.constScanLine(y));
+        for (int x = 0; x < w; ++x) {
+            const QRgb pixel = src[x];
+            *dst++ = static_cast<char>(qBlue(pixel));
+            *dst++ = static_cast<char>(qGreen(pixel));
+            *dst++ = static_cast<char>(qRed(pixel));
+            *dst++ = static_cast<char>(qAlpha(pixel));
+        }
+    }
+    return dib;
+}
+
+static QImage dibToImage(const QByteArray &dib)
+{
+    if (dib.size() < 40)
+        return {};
+
+    const char *p = dib.constData();
+
+    const quint32 headerSize = qFromLittleEndian<quint32>(p);
+    if (headerSize < 40)
+        return {};
+
+    const qint32 w = qFromLittleEndian<qint32>(p + 4);
+    const qint32 rawH = qFromLittleEndian<qint32>(p + 8);
+    const quint16 bitCount = qFromLittleEndian<quint16>(p + 14);
+
+    if (w <= 0 || rawH == 0)
+        return {};
+
+    const bool topDown = (rawH < 0);
+    const qint32 h = topDown ? -rawH : rawH;
+
+    if (bitCount != 32 && bitCount != 24)
+        return {};
+
+    const int bytesPerPixel = bitCount / 8;
+    // DIB rows are padded to 4-byte boundaries
+    const int rowBytes = (w * bytesPerPixel + 3) & ~3;
+    const qint64 expectedData = static_cast<qint64>(rowBytes) * h;
+    if (dib.size() < static_cast<qint64>(headerSize) + expectedData)
+        return {};
+
+    QImage result(w, h, QImage::Format_ARGB32);
+    const char *pixels = p + headerSize;
+
+    for (qint32 y = 0; y < h; ++y) {
+        const int srcRow = topDown ? y : (h - 1 - y);
+        const char *src = pixels + srcRow * rowBytes;
+        QRgb *dst = reinterpret_cast<QRgb *>(result.scanLine(y));
+        for (qint32 x = 0; x < w; ++x) {
+            const unsigned char b = static_cast<unsigned char>(src[x * bytesPerPixel]);
+            const unsigned char g = static_cast<unsigned char>(src[x * bytesPerPixel + 1]);
+            const unsigned char r = static_cast<unsigned char>(src[x * bytesPerPixel + 2]);
+            const unsigned char a = (bitCount == 32) ? static_cast<unsigned char>(src[x * bytesPerPixel + 3]) : 0xFF;
+            dst[x] = qRgba(r, g, b, a);
+        }
+    }
+    return result;
+}
+
 void QVncClient::Private::handleExtendedClipboard(const QByteArray &data)
 {
     if (data.size() < 4) return;
@@ -1710,19 +1817,30 @@ void QVncClient::Private::handleExtendedClipboard(const QByteArray &data)
         break;
     }
     case ClipboardNotify: {
-        // Server has new clipboard data; request text if available
-        if (formats & ClipboardText) {
-            sendExtendedClipboardRequest(ClipboardText);
-        }
+        // Server has new clipboard data; request available formats
+        quint32 requestFormats = 0;
+        if (formats & ClipboardText)
+            requestFormats |= ClipboardText;
+        if (formats & ClipboardDib)
+            requestFormats |= ClipboardDib;
+        if (requestFormats)
+            sendExtendedClipboardRequest(requestFormats);
         break;
     }
     case ClipboardRequest: {
         // Server requests our clipboard data
+        quint32 provideFormats = 0;
+        QMap<quint32, QByteArray> provideData;
         if ((formats & ClipboardText) && !pendingClipboardText.isEmpty()) {
-            QMap<quint32, QByteArray> provideData;
+            provideFormats |= ClipboardText;
             provideData.insert(ClipboardText, pendingClipboardText.toUtf8());
-            sendExtendedClipboardProvide(ClipboardText, provideData);
         }
+        if ((formats & ClipboardDib) && !pendingClipboardImage.isNull()) {
+            provideFormats |= ClipboardDib;
+            provideData.insert(ClipboardDib, imageToDib(pendingClipboardImage));
+        }
+        if (provideFormats)
+            sendExtendedClipboardProvide(provideFormats, provideData);
         break;
     }
     case ClipboardProvide: {
@@ -1783,17 +1901,28 @@ void QVncClient::Private::handleExtendedClipboard(const QByteArray &data)
                 const QString text = QString::fromUtf8(decompressed.mid(offset, size));
                 qCDebug(lcVncClient) << "Extended clipboard text:" << text.length() << "chars";
                 emit q->clipboardTextReceived(text);
+            } else if (bit == ClipboardDib) {
+                const QImage img = dibToImage(decompressed.mid(offset, size));
+                if (!img.isNull()) {
+                    qCDebug(lcVncClient) << "Extended clipboard DIB:" << img.width() << "x" << img.height();
+                    emit q->clipboardImageReceived(img);
+                }
             }
             offset += size;
         }
         break;
     }
-    case ClipboardPeek:
+    case ClipboardPeek: {
         // Server asks what formats we have; respond with notify
-        if (!pendingClipboardText.isEmpty()) {
-            sendExtendedClipboardNotify(ClipboardText);
-        }
+        quint32 notifyFormats = 0;
+        if (!pendingClipboardText.isEmpty())
+            notifyFormats |= ClipboardText;
+        if (!pendingClipboardImage.isNull())
+            notifyFormats |= ClipboardDib;
+        if (notifyFormats)
+            sendExtendedClipboardNotify(notifyFormats);
         break;
+    }
     default:
         qCDebug(lcVncClient) << "Unknown extended clipboard action:" << Qt::hex << action;
         break;
@@ -2666,4 +2795,16 @@ void QVncClient::handlePointerEvent(QMouseEvent *e)
 void QVncClient::sendClipboardText(const QString &text)
 {
     d->clientCutText(text);
+}
+
+/*!
+    Sends a clipboard image to the VNC server using the Extended Clipboard
+    DIB format. Requires Extended Clipboard support to be negotiated;
+    has no effect if the server does not support it.
+
+    \param image The image to send.
+*/
+void QVncClient::sendClipboardImage(const QImage &image)
+{
+    d->clientCutImage(image);
 }
