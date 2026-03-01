@@ -76,6 +76,7 @@ public slots:
     void setSocket(QTcpSocket *socket);
     void setPassword(const QString &password);
     void setFramebufferUpdatesEnabled(bool enabled);
+    void sendClipboardText(const QString &text);
 
 private:
     void setProtocolVersion(ProtocolVersion protocolVersion);
@@ -94,6 +95,7 @@ signals:
     void framebufferUpdated();
     void cursorChanged();
     void cursorPosChanged(const QPoint &pos);
+    void clipboardTextReceived(const QString &text);
 
 private:
     class Private;

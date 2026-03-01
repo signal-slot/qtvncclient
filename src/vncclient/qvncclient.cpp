@@ -102,6 +102,7 @@ public:
     */
     enum ServerMessageType {
         FramebufferUpdate = 0x00, ///< Server sends framebuffer update data
+        ServerCutText = 0x03,     ///< Server sends clipboard text
     };
 
     /*!
@@ -517,6 +518,8 @@ private:
     bool handleRichCursorEncoding(const Rectangle &rect);
     bool handleCursorPosEncoding(const Rectangle &rect);
 
+    void serverCutText();
+
 private:
     QVncClient *q;                              ///< Pointer to the public class
     QTcpSocket *prev = nullptr;                 ///< Previous socket for cleanup
@@ -559,6 +562,8 @@ public:
     QImage cursorImage;                         ///< Cursor shape with alpha from bitmask
     QPoint cursorHotspot;                       ///< Hotspot within cursor image
     QPoint cursorPos;                           ///< Last known cursor position from server
+
+    void clientCutText(const QString &text);
 };
 
 /*!
@@ -1465,15 +1470,43 @@ void QVncClient::Private::parseServerMessages()
     case FramebufferUpdate:
         framebufferUpdate();
         break;
+    case ServerCutText:
+        serverCutText();
+        break;
     default:
         qCWarning(lcVncClient) << "Unknown message type:" << messageType;
     }
 }
 
+void QVncClient::Private::serverCutText()
+{
+    if (socket->bytesAvailable() < 7) return;
+    socket->read(3); // padding
+    quint32_be length;
+    read(&length);
+    if (socket->bytesAvailable() < length) return;
+    const QByteArray data = socket->read(length);
+    const QString text = QString::fromLatin1(data);
+    qCDebug(lcVncClient) << "ServerCutText:" << text.length() << "chars";
+    emit q->clipboardTextReceived(text);
+}
+
+void QVncClient::Private::clientCutText(const QString &text)
+{
+    if (!socket) return;
+    const quint8 messageType = 0x06;
+    write(messageType);
+    socket->write("\0\0\0", 3); // padding
+    const QByteArray data = text.toLatin1();
+    quint32_be length(data.size());
+    write(length);
+    socket->write(data);
+}
+
 /*!
     \internal
     Processes a framebuffer update message.
-    
+
     Reads the number of rectangles and processes each one based on its encoding type.
 */
 void QVncClient::Private::framebufferUpdate()
@@ -2325,4 +2358,14 @@ void QVncClient::handleKeyEvent(QKeyEvent *e)
 void QVncClient::handlePointerEvent(QMouseEvent *e)
 {
     d->pointerEvent(e);
+}
+
+/*!
+    Sends clipboard text to the VNC server.
+
+    \param text The clipboard text to send.
+*/
+void QVncClient::sendClipboardText(const QString &text)
+{
+    d->clientCutText(text);
 }
