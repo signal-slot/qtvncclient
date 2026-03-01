@@ -125,6 +125,9 @@ public:
         // Pseudo-encodings (negative values per RFB spec)
         CursorPseudoEncoding = -239,    ///< RichCursor: server sends cursor shape
         CursorPosPseudoEncoding = -232, ///< CursorPos: server sends cursor position
+#ifdef USE_ZLIB
+        ExtendedClipboardPseudoEncoding = -1063131698, ///< 0xC0A1E5CE: Extended clipboard
+#endif
     };
     
     /*!
@@ -520,6 +523,31 @@ private:
 
     void serverCutText();
 
+#ifdef USE_ZLIB
+    enum ClipboardFormat : quint32 {
+        ClipboardText  = 0x00000001,
+        ClipboardRtf   = 0x00000002,
+        ClipboardHtml  = 0x00000004,
+        ClipboardDib   = 0x00000008,
+        ClipboardFiles = 0x00000010,
+    };
+
+    enum ClipboardAction : quint32 {
+        ClipboardCaps    = 0x01000000,
+        ClipboardRequest = 0x02000000,
+        ClipboardPeek    = 0x04000000,
+        ClipboardNotify  = 0x08000000,
+        ClipboardProvide = 0x10000000,
+    };
+
+    void handleExtendedClipboard(const QByteArray &data);
+    void sendExtendedClipboardCaps();
+    void sendExtendedClipboardRequest(quint32 formats);
+    void sendExtendedClipboardNotify(quint32 formats);
+    void sendExtendedClipboardProvide(quint32 formats, const QMap<quint32, QByteArray> &data);
+    void sendExtendedClipboardMessage(const QByteArray &payload);
+#endif
+
 private:
     QVncClient *q;                              ///< Pointer to the public class
     QTcpSocket *prev = nullptr;                 ///< Previous socket for cleanup
@@ -564,6 +592,17 @@ public:
     QPoint cursorPos;                           ///< Last known cursor position from server
 
     void clientCutText(const QString &text);
+
+#ifdef USE_ZLIB
+    bool extendedClipboard = false;
+    quint32 remoteClipboardCaps = 0;
+    QMap<quint32, quint32> remoteClipboardSizes;
+    z_stream clipboardInflateStream;
+    bool clipboardInflateActive = false;
+    z_stream clipboardDeflateStream;
+    bool clipboardDeflateActive = false;
+    QString pendingClipboardText;
+#endif
 };
 
 /*!
@@ -670,6 +709,12 @@ void QVncClient::Private::reset()
     cursorPos = QPoint();
 #ifdef USE_ZLIB
     if (zrleStreamActive) { inflateEnd(&zrleStream); zrleStreamActive = false; }
+    if (clipboardInflateActive) { inflateEnd(&clipboardInflateStream); clipboardInflateActive = false; }
+    if (clipboardDeflateActive) { deflateEnd(&clipboardDeflateStream); clipboardDeflateActive = false; }
+    extendedClipboard = false;
+    remoteClipboardCaps = 0;
+    remoteClipboardSizes.clear();
+    pendingClipboardText.clear();
 #endif
     emit q->framebufferSizeChanged(0, 0);
 }
@@ -1390,6 +1435,9 @@ void QVncClient::Private::parserServerInit()
         RawEncoding,
         CursorPseudoEncoding,
         CursorPosPseudoEncoding,
+#ifdef USE_ZLIB
+        ExtendedClipboardPseudoEncoding,
+#endif
     };
     setEncodings(encodings);
     if (framebufferUpdatesEnabled)
@@ -1482,18 +1530,44 @@ void QVncClient::Private::serverCutText()
 {
     if (socket->bytesAvailable() < 7) return;
     socket->read(3); // padding
-    quint32_be length;
-    read(&length);
-    if (socket->bytesAvailable() < length) return;
-    const QByteArray data = socket->read(length);
-    const QString text = QString::fromLatin1(data);
-    qCDebug(lcVncClient) << "ServerCutText:" << text.length() << "chars";
-    emit q->clipboardTextReceived(text);
+    qint32_be signedLength;
+    read(&signedLength);
+    const qint32 length = signedLength;
+    if (length >= 0) {
+        // Legacy: Latin-1 text
+        if (socket->bytesAvailable() < length) return;
+        const QByteArray data = socket->read(length);
+        const QString text = QString::fromLatin1(data);
+        qCDebug(lcVncClient) << "ServerCutText:" << text.length() << "chars";
+        emit q->clipboardTextReceived(text);
+        return;
+    }
+#ifdef USE_ZLIB
+    // Extended clipboard: length is negative, absolute value is payload size
+    const quint32 extLength = static_cast<quint32>(-length);
+    if (socket->bytesAvailable() < static_cast<qint64>(extLength)) return;
+    handleExtendedClipboard(socket->read(extLength));
+#else
+    // Skip extended clipboard data when zlib is not available
+    const quint32 extLength = static_cast<quint32>(-length);
+    if (socket->bytesAvailable() < static_cast<qint64>(extLength)) return;
+    socket->read(extLength);
+#endif
 }
 
 void QVncClient::Private::clientCutText(const QString &text)
 {
     if (!socket) return;
+#ifdef USE_ZLIB
+    if (extendedClipboard) {
+        // Store text for when server sends a request
+        pendingClipboardText = text;
+        // Notify server that we have text available
+        sendExtendedClipboardNotify(ClipboardText);
+        return;
+    }
+#endif
+    // Legacy: Latin-1 text
     const quint8 messageType = 0x06;
     write(messageType);
     socket->write("\0\0\0", 3); // padding
@@ -1502,6 +1576,230 @@ void QVncClient::Private::clientCutText(const QString &text)
     write(length);
     socket->write(data);
 }
+
+#ifdef USE_ZLIB
+void QVncClient::Private::sendExtendedClipboardMessage(const QByteArray &payload)
+{
+    if (!socket) return;
+    const quint8 messageType = 0x06;
+    write(messageType);
+    socket->write("\0\0\0", 3); // padding
+    // Negative length signals extended clipboard
+    const qint32_be negLength(-static_cast<qint32>(payload.size()));
+    write(negLength);
+    socket->write(payload);
+}
+
+void QVncClient::Private::sendExtendedClipboardCaps()
+{
+    // Declare: we support text format, and caps/request/peek/notify/provide actions
+    const quint32 flags = ClipboardText
+                        | ClipboardCaps
+                        | ClipboardRequest
+                        | ClipboardPeek
+                        | ClipboardNotify
+                        | ClipboardProvide;
+
+    QByteArray payload;
+    payload.resize(4 + 4); // flags + one size entry for text format
+    qToBigEndian<quint32>(flags, payload.data());
+    // Max size for text format (0 = force notify/request/provide flow)
+    qToBigEndian<quint32>(0, payload.data() + 4);
+    sendExtendedClipboardMessage(payload);
+}
+
+void QVncClient::Private::sendExtendedClipboardRequest(quint32 formats)
+{
+    const quint32 flags = formats | ClipboardRequest;
+    QByteArray payload(4, '\0');
+    qToBigEndian<quint32>(flags, payload.data());
+    sendExtendedClipboardMessage(payload);
+}
+
+void QVncClient::Private::sendExtendedClipboardNotify(quint32 formats)
+{
+    const quint32 flags = formats | ClipboardNotify;
+    QByteArray payload(4, '\0');
+    qToBigEndian<quint32>(flags, payload.data());
+    sendExtendedClipboardMessage(payload);
+}
+
+void QVncClient::Private::sendExtendedClipboardProvide(quint32 formats, const QMap<quint32, QByteArray> &data)
+{
+    // Build the uncompressed payload: for each format bit set (in order),
+    // write a 4-byte size followed by the data
+    QByteArray uncompressed;
+    for (quint32 bit = 0x01; bit <= 0x10; bit <<= 1) {
+        if (!(formats & bit))
+            continue;
+        const QByteArray &d = data.value(bit);
+        const quint32 size = d.size();
+        char sizeBuf[4];
+        qToBigEndian<quint32>(size, sizeBuf);
+        uncompressed.append(sizeBuf, 4);
+        uncompressed.append(d);
+    }
+
+    // Zlib-compress the payload
+    if (!clipboardDeflateActive) {
+        memset(&clipboardDeflateStream, 0, sizeof(clipboardDeflateStream));
+        if (deflateInit(&clipboardDeflateStream, Z_DEFAULT_COMPRESSION) != Z_OK) {
+            qCWarning(lcVncClient) << "Failed to init zlib deflate for clipboard";
+            return;
+        }
+        clipboardDeflateActive = true;
+    } else {
+        deflateReset(&clipboardDeflateStream);
+    }
+
+    QByteArray compressed;
+    compressed.resize(deflateBound(&clipboardDeflateStream, uncompressed.size()));
+    clipboardDeflateStream.next_in = reinterpret_cast<Bytef *>(uncompressed.data());
+    clipboardDeflateStream.avail_in = uncompressed.size();
+    clipboardDeflateStream.next_out = reinterpret_cast<Bytef *>(compressed.data());
+    clipboardDeflateStream.avail_out = compressed.size();
+
+    if (deflate(&clipboardDeflateStream, Z_FINISH) != Z_STREAM_END) {
+        qCWarning(lcVncClient) << "Failed to compress clipboard data";
+        return;
+    }
+    compressed.resize(clipboardDeflateStream.total_out);
+
+    // Build the full message: 4-byte flags + compressed data
+    const quint32 flags = formats | ClipboardProvide;
+    QByteArray payload(4, '\0');
+    qToBigEndian<quint32>(flags, payload.data());
+    payload.append(compressed);
+    sendExtendedClipboardMessage(payload);
+}
+
+void QVncClient::Private::handleExtendedClipboard(const QByteArray &data)
+{
+    if (data.size() < 4) return;
+
+    const quint32 flags = qFromBigEndian<quint32>(data.constData());
+    const quint32 action = flags & 0xFF000000;
+    const quint32 formats = flags & 0x0000FFFF;
+
+    qCDebug(lcVncClient) << "Extended clipboard: action=" << Qt::hex << action
+                         << "formats=" << formats;
+
+    switch (action) {
+    case ClipboardCaps: {
+        // Parse remote capabilities
+        remoteClipboardCaps = flags;
+        remoteClipboardSizes.clear();
+
+        // After the flags, there is one 4-byte size per format bit set
+        int offset = 4;
+        for (quint32 bit = 0x01; bit <= 0x10; bit <<= 1) {
+            if (!(formats & bit))
+                continue;
+            if (offset + 4 > data.size())
+                break;
+            const quint32 maxSize = qFromBigEndian<quint32>(data.constData() + offset);
+            remoteClipboardSizes.insert(bit, maxSize);
+            offset += 4;
+        }
+
+        extendedClipboard = true;
+        qCDebug(lcVncClient) << "Extended clipboard negotiated, formats:" << Qt::hex << formats;
+
+        // Respond with our own capabilities
+        sendExtendedClipboardCaps();
+        break;
+    }
+    case ClipboardNotify: {
+        // Server has new clipboard data; request text if available
+        if (formats & ClipboardText) {
+            sendExtendedClipboardRequest(ClipboardText);
+        }
+        break;
+    }
+    case ClipboardRequest: {
+        // Server requests our clipboard data
+        if ((formats & ClipboardText) && !pendingClipboardText.isEmpty()) {
+            QMap<quint32, QByteArray> provideData;
+            provideData.insert(ClipboardText, pendingClipboardText.toUtf8());
+            sendExtendedClipboardProvide(ClipboardText, provideData);
+        }
+        break;
+    }
+    case ClipboardProvide: {
+        // Zlib-compressed data follows the flags
+        if (data.size() <= 4)
+            break;
+
+        const QByteArray compressed = data.mid(4);
+
+        // Initialize inflate stream if needed
+        if (!clipboardInflateActive) {
+            memset(&clipboardInflateStream, 0, sizeof(clipboardInflateStream));
+            if (inflateInit(&clipboardInflateStream) != Z_OK) {
+                qCWarning(lcVncClient) << "Failed to init zlib inflate for clipboard";
+                break;
+            }
+            clipboardInflateActive = true;
+        } else {
+            inflateReset(&clipboardInflateStream);
+        }
+
+        // Decompress with growing buffer
+        QByteArray decompressed;
+        decompressed.resize(compressed.size() * 4);
+        clipboardInflateStream.next_in = reinterpret_cast<Bytef *>(const_cast<char *>(compressed.data()));
+        clipboardInflateStream.avail_in = compressed.size();
+
+        int totalOut = 0;
+        int ret;
+        do {
+            clipboardInflateStream.next_out = reinterpret_cast<Bytef *>(decompressed.data() + totalOut);
+            clipboardInflateStream.avail_out = decompressed.size() - totalOut;
+            ret = inflate(&clipboardInflateStream, Z_SYNC_FLUSH);
+            totalOut = clipboardInflateStream.total_out;
+            if (clipboardInflateStream.avail_out == 0 && ret != Z_STREAM_END) {
+                decompressed.resize(decompressed.size() * 2);
+            }
+        } while (ret == Z_OK);
+
+        if (ret != Z_STREAM_END && ret != Z_OK) {
+            qCWarning(lcVncClient) << "Failed to decompress clipboard data:" << ret;
+            break;
+        }
+        decompressed.resize(totalOut);
+
+        // Parse size+data pairs per format bit
+        int offset = 0;
+        for (quint32 bit = 0x01; bit <= 0x10; bit <<= 1) {
+            if (!(formats & bit))
+                continue;
+            if (offset + 4 > decompressed.size())
+                break;
+            const quint32 size = qFromBigEndian<quint32>(decompressed.constData() + offset);
+            offset += 4;
+            if (offset + static_cast<qint64>(size) > decompressed.size())
+                break;
+            if (bit == ClipboardText) {
+                const QString text = QString::fromUtf8(decompressed.mid(offset, size));
+                qCDebug(lcVncClient) << "Extended clipboard text:" << text.length() << "chars";
+                emit q->clipboardTextReceived(text);
+            }
+            offset += size;
+        }
+        break;
+    }
+    case ClipboardPeek:
+        // Server asks what formats we have; respond with notify
+        if (!pendingClipboardText.isEmpty()) {
+            sendExtendedClipboardNotify(ClipboardText);
+        }
+        break;
+    default:
+        qCDebug(lcVncClient) << "Unknown extended clipboard action:" << Qt::hex << action;
+        break;
+    }
+}
+#endif
 
 /*!
     \internal
