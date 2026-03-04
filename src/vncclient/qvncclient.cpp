@@ -1814,12 +1814,8 @@ void QVncClient::Private::handleExtendedClipboard(const QByteArray &data)
         // Respond with our own capabilities
         sendExtendedClipboardCaps();
     } else if (action & ClipboardNotify) {
-        // Server has new clipboard data; request available formats
-        quint32 requestFormats = 0;
-        if (formats & ClipboardText)
-            requestFormats |= ClipboardText;
-        if (formats & ClipboardDib)
-            requestFormats |= ClipboardDib;
+        // Server has new clipboard data; request the formats we support
+        const quint32 requestFormats = formats & (ClipboardText | ClipboardDib);
         if (requestFormats)
             sendExtendedClipboardRequest(requestFormats);
     } else if (action & ClipboardRequest) {
