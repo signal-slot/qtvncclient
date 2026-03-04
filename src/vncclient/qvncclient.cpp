@@ -521,7 +521,7 @@ private:
     bool handleRichCursorEncoding(const Rectangle &rect);
     bool handleCursorPosEncoding(const Rectangle &rect);
 
-    void serverCutText();
+    bool serverCutText();
 
 #ifdef USE_ZLIB
     enum ClipboardFormat : quint32 {
@@ -553,6 +553,7 @@ private:
     QTcpSocket *prev = nullptr;                 ///< Previous socket for cleanup
     HandshakingState state = ProtocolVersionState; ///< Current protocol state
     bool reading = false;                           ///< Reentrancy guard for read()
+    qint16 pendingServerMessage = -1;               ///< Saved message type when handler needs more data
 
     // Framebuffer update state for non-blocking processing
     struct {
@@ -703,6 +704,7 @@ void QVncClient::Private::reset()
     q->setSecurityType(SecurityTypeUnknwon);
     vncChallenge.clear();
     fbu.active = false;
+    pendingServerMessage = -1;
     frameBufferWidth = 0;
     frameBufferHeight = 0;
     image = QImage();
@@ -756,8 +758,8 @@ void QVncClient::Private::read()
     }
     reading = false;
     // Re-enter if there is buffered data we can still make progress on.
-    // Skip when waiting for more data mid-FBU to avoid a spin loop.
-    if (socket && socket->bytesAvailable() > 0 && !fbu.active)
+    // Skip when waiting for more data mid-message to avoid a spin loop.
+    if (socket && socket->bytesAvailable() > 0 && !fbu.active && pendingServerMessage < 0)
         QMetaObject::invokeMethod(q, [this]() { read(); }, Qt::QueuedConnection);
 }
 
@@ -1514,48 +1516,58 @@ void QVncClient::Private::parseServerMessages()
         processFramebufferRects();
         return;
     }
-    if (socket->bytesAvailable() < 1) return;
-    quint8 messageType = 0;
-    read(&messageType);
+    quint8 messageType;
+    if (pendingServerMessage >= 0) {
+        messageType = static_cast<quint8>(pendingServerMessage);
+        pendingServerMessage = -1;
+    } else {
+        if (socket->bytesAvailable() < 1) return;
+        read(&messageType);
+    }
     switch (messageType) {
     case FramebufferUpdate:
         framebufferUpdate();
         break;
     case ServerCutText:
-        serverCutText();
+        if (!serverCutText())
+            pendingServerMessage = messageType;
         break;
     default:
         qCWarning(lcVncClient) << "Unknown message type:" << messageType;
     }
 }
 
-void QVncClient::Private::serverCutText()
+bool QVncClient::Private::serverCutText()
 {
-    if (socket->bytesAvailable() < 7) return;
-    socket->read(3); // padding
-    qint32_be signedLength;
-    read(&signedLength);
-    const qint32 length = signedLength;
+    if (socket->bytesAvailable() < 7) return false;
+
+    // Peek at header to determine total message size before consuming any bytes
+    const QByteArray header = socket->peek(7);
+    const qint32 length = qFromBigEndian<qint32>(header.constData() + 3);
+    const qint64 payloadSize = (length >= 0)
+        ? static_cast<qint64>(length)
+        : static_cast<qint64>(static_cast<quint32>(-length));
+    if (socket->bytesAvailable() < 7 + payloadSize) return false;
+
+    // Full message available — consume header
+    socket->read(7); // padding(3) + length(4)
+
     if (length >= 0) {
         // Legacy: Latin-1 text
-        if (socket->bytesAvailable() < length) return;
         const QByteArray data = socket->read(length);
         const QString text = QString::fromLatin1(data);
         qCDebug(lcVncClient) << "ServerCutText:" << text.length() << "chars";
         emit q->clipboardTextReceived(text);
-        return;
+        return true;
     }
 #ifdef USE_ZLIB
     // Extended clipboard: length is negative, absolute value is payload size
-    const quint32 extLength = static_cast<quint32>(-length);
-    if (socket->bytesAvailable() < static_cast<qint64>(extLength)) return;
-    handleExtendedClipboard(socket->read(extLength));
+    handleExtendedClipboard(socket->read(static_cast<quint32>(-length)));
 #else
     // Skip extended clipboard data when zlib is not available
-    const quint32 extLength = static_cast<quint32>(-length);
-    if (socket->bytesAvailable() < static_cast<qint64>(extLength)) return;
-    socket->read(extLength);
+    socket->read(static_cast<quint32>(-length));
 #endif
+    return true;
 }
 
 void QVncClient::Private::clientCutText(const QString &text)
