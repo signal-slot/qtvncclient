@@ -600,8 +600,6 @@ public:
 
 #ifdef USE_ZLIB
     bool extendedClipboard = false;
-    quint32 remoteClipboardCaps = 0;
-    QMap<quint32, quint32> remoteClipboardSizes;
     z_stream clipboardInflateStream;
     bool clipboardInflateActive = false;
     z_stream clipboardDeflateStream;
@@ -719,8 +717,6 @@ void QVncClient::Private::reset()
     if (clipboardInflateActive) { inflateEnd(&clipboardInflateStream); clipboardInflateActive = false; }
     if (clipboardDeflateActive) { deflateEnd(&clipboardDeflateStream); clipboardDeflateActive = false; }
     extendedClipboard = false;
-    remoteClipboardCaps = 0;
-    remoteClipboardSizes.clear();
     pendingClipboardText.clear();
     pendingClipboardImage = QImage();
 #endif
@@ -1812,22 +1808,6 @@ void QVncClient::Private::handleExtendedClipboard(const QByteArray &data)
     const quint32 formats = flags & 0x0000FFFF;
 
     if (action & ClipboardCaps) {
-        // Parse remote capabilities
-        remoteClipboardCaps = flags;
-        remoteClipboardSizes.clear();
-
-        // After the flags, there is one 4-byte size per format bit set
-        int offset = 4;
-        for (quint32 bit = 0x01; bit <= 0x10; bit <<= 1) {
-            if (!(formats & bit))
-                continue;
-            if (offset + 4 > data.size())
-                break;
-            const quint32 maxSize = qFromBigEndian<quint32>(data.constData() + offset);
-            remoteClipboardSizes.insert(bit, maxSize);
-            offset += 4;
-        }
-
         extendedClipboard = true;
         qCDebug(lcVncClient) << "Extended clipboard negotiated, formats:" << Qt::hex << formats;
 
