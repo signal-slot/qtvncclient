@@ -1658,7 +1658,11 @@ void QVncClient::Private::sendExtendedClipboardProvide(quint32 formats, const QM
 {
     // Build the uncompressed payload: for each format bit set (in order),
     // write a 4-byte size followed by the data
+    qint64 totalSize = 0;
+    for (auto it = data.cbegin(); it != data.cend(); ++it)
+        totalSize += 4 + it.value().size();
     QByteArray uncompressed;
+    uncompressed.reserve(totalSize);
     for (quint32 bit = 0x01; bit <= 0x10; bit <<= 1) {
         if (!(formats & bit))
             continue;
@@ -1697,7 +1701,9 @@ void QVncClient::Private::sendExtendedClipboardProvide(quint32 formats, const QM
 
     // Build the full message: 4-byte flags + compressed data
     const quint32 flags = formats | ClipboardProvide;
-    QByteArray payload(4, '\0');
+    QByteArray payload;
+    payload.reserve(4 + compressed.size());
+    payload.resize(4);
     qToBigEndian<quint32>(flags, payload.data());
     payload.append(compressed);
     sendExtendedClipboardMessage(payload);
@@ -1892,11 +1898,11 @@ void QVncClient::Private::handleExtendedClipboard(const QByteArray &data)
             if (offset + static_cast<qint64>(size) > decompressed.size())
                 break;
             if (bit == ClipboardText) {
-                const QString text = QString::fromUtf8(decompressed.mid(offset, size));
+                const QString text = QString::fromUtf8(decompressed.constData() + offset, size);
                 qCDebug(lcVncClient) << "Extended clipboard text:" << text.length() << "chars";
                 emit q->clipboardTextReceived(text);
             } else if (bit == ClipboardDib) {
-                const QImage img = dibToImage(decompressed.mid(offset, size));
+                const QImage img = dibToImage(QByteArray::fromRawData(decompressed.constData() + offset, size));
                 if (!img.isNull()) {
                     qCDebug(lcVncClient) << "Extended clipboard DIB:" << img.width() << "x" << img.height();
                     emit q->clipboardImageReceived(img);
