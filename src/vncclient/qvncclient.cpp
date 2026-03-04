@@ -1858,8 +1858,6 @@ void QVncClient::Private::handleExtendedClipboard(const QByteArray &data)
         if (data.size() <= 4)
             return;
 
-        const QByteArray compressed = data.mid(4);
-
         // Initialize inflate stream if needed
         if (!clipboardInflateActive) {
             memset(&clipboardInflateStream, 0, sizeof(clipboardInflateStream));
@@ -1872,13 +1870,15 @@ void QVncClient::Private::handleExtendedClipboard(const QByteArray &data)
             inflateReset(&clipboardInflateStream);
         }
 
-        // Decompress with growing buffer
+        // Decompress with growing buffer (capped to prevent zip bombs)
+        constexpr qint64 maxDecompressedSize = 256 * 1024 * 1024; // 256 MB
+        const int compressedSize = data.size() - 4;
         QByteArray decompressed;
-        decompressed.resize(compressed.size() * 4);
-        clipboardInflateStream.next_in = reinterpret_cast<Bytef *>(const_cast<char *>(compressed.data()));
-        clipboardInflateStream.avail_in = compressed.size();
+        decompressed.resize(qMin(static_cast<qint64>(compressedSize) * 4, maxDecompressedSize));
+        clipboardInflateStream.next_in = reinterpret_cast<Bytef *>(const_cast<char *>(data.constData() + 4));
+        clipboardInflateStream.avail_in = compressedSize;
 
-        int totalOut = 0;
+        qint64 totalOut = 0;
         int ret;
         do {
             clipboardInflateStream.next_out = reinterpret_cast<Bytef *>(decompressed.data() + totalOut);
@@ -1886,7 +1886,12 @@ void QVncClient::Private::handleExtendedClipboard(const QByteArray &data)
             ret = inflate(&clipboardInflateStream, Z_SYNC_FLUSH);
             totalOut = clipboardInflateStream.total_out;
             if (clipboardInflateStream.avail_out == 0 && ret != Z_STREAM_END) {
-                decompressed.resize(decompressed.size() * 2);
+                const qint64 newSize = static_cast<qint64>(decompressed.size()) * 2;
+                if (newSize > maxDecompressedSize) {
+                    qCWarning(lcVncClient) << "Clipboard decompressed data exceeds size limit";
+                    return;
+                }
+                decompressed.resize(newSize);
             }
         } while (ret == Z_OK);
 
