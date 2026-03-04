@@ -1711,8 +1711,9 @@ static QByteArray imageToDib(const QImage &image)
     const int h = argb.height();
 
     // 40-byte BITMAPINFOHEADER + BGRA pixel data
+    const qint64 pixelDataSize = static_cast<qint64>(w) * h * 4;
     QByteArray dib;
-    dib.resize(40 + w * h * 4);
+    dib.resize(40 + pixelDataSize);
     char *p = dib.data();
 
     // BITMAPINFOHEADER
@@ -1722,7 +1723,7 @@ static QByteArray imageToDib(const QImage &image)
     qToLittleEndian<quint16>(1, p + 12);       // biPlanes
     qToLittleEndian<quint16>(32, p + 14);      // biBitCount
     qToLittleEndian<quint32>(0, p + 16);       // biCompression (BI_RGB)
-    qToLittleEndian<quint32>(w * h * 4, p + 20); // biSizeImage
+    qToLittleEndian<quint32>(static_cast<quint32>(pixelDataSize), p + 20); // biSizeImage
     qToLittleEndian<qint32>(0, p + 24);        // biXPelsPerMeter
     qToLittleEndian<qint32>(0, p + 28);        // biYPelsPerMeter
     qToLittleEndian<quint32>(0, p + 32);       // biClrUsed
@@ -1767,19 +1768,26 @@ static QImage dibToImage(const QByteArray &dib)
     if (bitCount != 32 && bitCount != 24)
         return {};
 
+    // Sanity check dimensions to prevent excessive memory allocation
+    constexpr qint32 maxDim = 16384;
+    if (w > maxDim || h > maxDim)
+        return {};
+
     const int bytesPerPixel = bitCount / 8;
-    // DIB rows are padded to 4-byte boundaries
-    const int rowBytes = (w * bytesPerPixel + 3) & ~3;
-    const qint64 expectedData = static_cast<qint64>(rowBytes) * h;
+    // DIB rows are padded to 4-byte boundaries (use qint64 to prevent overflow)
+    const qint64 rowBytes = (static_cast<qint64>(w) * bytesPerPixel + 3) & ~3;
+    const qint64 expectedData = rowBytes * h;
     if (dib.size() < static_cast<qint64>(headerSize) + expectedData)
         return {};
 
     QImage result(w, h, QImage::Format_ARGB32);
+    if (result.isNull())
+        return {};
     const char *pixels = p + headerSize;
 
     for (qint32 y = 0; y < h; ++y) {
-        const int srcRow = topDown ? y : (h - 1 - y);
-        const char *src = pixels + srcRow * rowBytes;
+        const qint32 srcRow = topDown ? y : (h - 1 - y);
+        const char *src = pixels + static_cast<qint64>(srcRow) * rowBytes;
         QRgb *dst = reinterpret_cast<QRgb *>(result.scanLine(y));
         for (qint32 x = 0; x < w; ++x) {
             const unsigned char b = static_cast<unsigned char>(src[x * bytesPerPixel]);
