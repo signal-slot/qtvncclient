@@ -90,6 +90,9 @@ public:
         SetPixelFormat = 0x00,           ///< Set the pixel format for framebuffer data
         SetEncodings = 0x02,             ///< Set the encoding types the client supports
         FramebufferUpdateRequest = 0x03, ///< Request an update of the framebuffer
+        KeyEvent = 0x04,                 ///< Key press/release event
+        PointerEvent = 0x05,             ///< Mouse movement/button event
+        ClientCutText = 0x06,            ///< Client sends clipboard text
     };
 
     /*!
@@ -1583,7 +1586,7 @@ void QVncClient::Private::clientCutText(const QString &text)
     }
 #endif
     // Legacy: Latin-1 text
-    const quint8 messageType = 0x06;
+    const quint8 messageType = ClientCutText;
     write(messageType);
     socket->write("\0\0\0", 3); // padding
     const QByteArray data = text.toLatin1();
@@ -1609,7 +1612,7 @@ void QVncClient::Private::clientCutImage(const QImage &image)
 void QVncClient::Private::sendExtendedClipboardMessage(const QByteArray &payload)
 {
     if (!socket) return;
-    const quint8 messageType = 0x06;
+    const quint8 messageType = ClientCutText;
     write(messageType);
     socket->write("\0\0\0", 3); // padding
     // Negative length signals extended clipboard
@@ -2524,7 +2527,7 @@ bool QVncClient::Private::handleZRLEEncoding(const Rectangle &rect)
 void QVncClient::Private::keyEvent(QKeyEvent *e)
 {
     if (!socket) return;
-    const quint8 messageType = 0x04;
+    const quint8 messageType = KeyEvent;
     write(messageType);
     const quint8 downFlag = e->type() == QEvent::KeyPress ? 1 : 0;
     write(downFlag);
@@ -2549,7 +2552,7 @@ void QVncClient::Private::keyEvent(QKeyEvent *e)
 void QVncClient::Private::pointerEvent(QMouseEvent *e)
 {
     if (!socket) return;
-    const quint8 messageType = 0x05;
+    const quint8 messageType = PointerEvent;
     write(messageType);
 
     quint8 buttonMask = 0;
