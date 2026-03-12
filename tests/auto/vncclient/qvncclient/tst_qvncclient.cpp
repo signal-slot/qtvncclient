@@ -22,6 +22,7 @@ private slots:
     void init();
     void cleanup();
     
+    void testUsernameProperty();         // Test username property
     void testConnectionHandshake();     // Test basic connection flow
     void testDisconnection();
     void testProtocolVersion();         // Test protocol version property
@@ -175,6 +176,30 @@ bool tst_qvncclient::waitForSignal(QObject *sender, const char *signal, int time
     
     // Return true if timer is still active (meaning signal was received)
     return timer.isActive();
+}
+
+void tst_qvncclient::testUsernameProperty()
+{
+    QVncClient client;
+
+    // Default should be empty
+    QVERIFY(client.username().isEmpty());
+
+    // Test set/get
+    QSignalSpy usernameSpy(&client, &QVncClient::usernameChanged);
+    client.setUsername("testuser");
+    QCOMPARE(client.username(), QString("testuser"));
+    QCOMPARE(usernameSpy.count(), 1);
+    QCOMPARE(usernameSpy.first().at(0).toString(), QString("testuser"));
+
+    // Setting same value should not emit signal
+    client.setUsername("testuser");
+    QCOMPARE(usernameSpy.count(), 1);
+
+    // Setting different value should emit
+    client.setUsername("other");
+    QCOMPARE(usernameSpy.count(), 2);
+    QCOMPARE(client.username(), QString("other"));
 }
 
 // Test that the client can successfully establish a connection to a VNC server

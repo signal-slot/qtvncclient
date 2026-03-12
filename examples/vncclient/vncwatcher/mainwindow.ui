@@ -64,6 +64,23 @@
         </widget>
        </item>
        <item>
+        <widget class="QLabel" name="usernameLabel">
+         <property name="text">
+          <string>&amp;Username:</string>
+         </property>
+         <property name="buddy">
+          <cstring>username</cstring>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QLineEdit" name="username">
+         <property name="placeholderText">
+          <string>(optional)</string>
+         </property>
+        </widget>
+       </item>
+       <item>
         <widget class="QLabel" name="passwordLabel">
          <property name="text">
           <string>&amp;Password:</string>
@@ -138,6 +155,7 @@
  <tabstops>
   <tabstop>server</tabstop>
   <tabstop>port</tabstop>
+  <tabstop>username</tabstop>
   <tabstop>password</tabstop>
   <tabstop>watch</tabstop>
  </tabstops>

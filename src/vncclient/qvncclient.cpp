@@ -48,6 +48,10 @@
 #include <zlib.h>
 #endif
 
+#if QT_CONFIG(ssl)
+#include <QtNetwork/QSslSocket>
+#endif
+
 /*!
     \internal
     \class QVncClient::Private
@@ -73,6 +77,11 @@ public:
         SecurityState = 0x612,        ///< Negotiating security type
         SecurityResultState = 0x613,  ///< Processing security handshake result
         VncAuthenticationState = 0x614, ///< VNC authentication challenge-response
+        VeNCryptVersionState = 0x615, ///< VeNCrypt version negotiation
+        VeNCryptSubTypeState = 0x616, ///< VeNCrypt sub-type selection
+        VeNCryptAckState = 0x617,     ///< VeNCrypt sub-type acknowledgement
+        VeNCryptTLSState = 0x618,     ///< VeNCrypt TLS handshake
+        PlainAuthenticationState = 0x619, ///< VeNCrypt Plain authentication
         ClientInitState = 0x631,      ///< Client initialization
         ServerInitState = 0x632,      ///< Server initialization
         WaitingState = 0x640,         ///< Normal operation state, waiting for server messages
@@ -394,6 +403,15 @@ private:
     void parseVncAuthentication();
     void sendVncAuthResponse();
 
+    // VeNCrypt protocol handlers
+    void parseVeNCryptVersion();
+    void parseVeNCryptSubTypes();
+    void parseVeNCryptAck();
+    void startTLSHandshake();
+    void tlsHandshakeFinished();
+    void parsePlainAuthentication();
+    void sendPlainAuthResponse();
+
     /*!
         \internal
         \brief Parses the security result message.
@@ -584,7 +602,9 @@ public:
     ProtocolVersion protocolVersion = ProtocolVersionUnknown; ///< Current protocol version
     SecurityType securityType = SecurityTypeUnknwon;         ///< Current security type
     QString password;                             ///< Stored password for VNC authentication
+    QString username;                            ///< Stored username for VeNCrypt Plain auth
     QByteArray vncChallenge;                     ///< Stored challenge for deferred VNC auth
+    quint32 veNCryptSubType = 0;                 ///< Selected VeNCrypt sub-type
     QImage image;                               ///< Image containing the framebuffer
     int frameBufferWidth = 0;                   ///< Framebuffer width
     int frameBufferHeight = 0;                  ///< Framebuffer height
@@ -695,6 +715,12 @@ QVncClient::Private::Private(QVncClient *parent)
     connect(q, &QVncClient::passwordChanged, q, [this](const QString &) {
         if (state == VncAuthenticationState && !vncChallenge.isEmpty() && !password.isEmpty())
             sendVncAuthResponse();
+        if (state == PlainAuthenticationState && !username.isEmpty() && !password.isEmpty())
+            sendPlainAuthResponse();
+    });
+    connect(q, &QVncClient::usernameChanged, q, [this](const QString &) {
+        if (state == PlainAuthenticationState && !username.isEmpty() && !password.isEmpty())
+            sendPlainAuthResponse();
     });
 }
 
@@ -704,6 +730,7 @@ void QVncClient::Private::reset()
     q->setProtocolVersion(ProtocolVersionUnknown);
     q->setSecurityType(SecurityTypeUnknwon);
     vncChallenge.clear();
+    veNCryptSubType = 0;
     fbu.active = false;
     pendingServerMessage = -1;
     frameBufferWidth = 0;
@@ -741,6 +768,20 @@ void QVncClient::Private::read()
         break;
     case VncAuthenticationState:
         parseVncAuthentication();
+        break;
+    case VeNCryptVersionState:
+        parseVeNCryptVersion();
+        break;
+    case VeNCryptSubTypeState:
+        parseVeNCryptSubTypes();
+        break;
+    case VeNCryptAckState:
+        parseVeNCryptAck();
+        break;
+    case VeNCryptTLSState:
+        break;
+    case PlainAuthenticationState:
+        parsePlainAuthentication();
         break;
     case SecurityResultState:
         parseSecurityResult();
@@ -1116,7 +1157,7 @@ void QVncClient::Private::parseProtocolVersion()
         q->setProtocolVersion(ProtocolVersion33);
     else if (value == "RFB 003.007\n")
         q->setProtocolVersion(ProtocolVersion37);
-    else if (value == "RFB 003.008\n")
+    else if (value == "RFB 003.008\n" || value == "RFB 003.889\n")
         q->setProtocolVersion(ProtocolVersion38);
     else
         qCWarning(lcVncClient) << "Unsupported protocol version:" << value;
@@ -1214,7 +1255,9 @@ void QVncClient::Private::parseSecurity37()
         read(&securityType);
         securityTypes.append(securityType);
     }
-    if (securityTypes.contains(SecurityTypeVncAuthentication))
+    if (securityTypes.contains(SecurityTypeVeNCrypt))
+        q->setSecurityType(SecurityTypeVeNCrypt);
+    else if (securityTypes.contains(SecurityTypeVncAuthentication))
         q->setSecurityType(SecurityTypeVncAuthentication);
     else if (securityTypes.contains(SecurityTypeNone))
         q->setSecurityType(SecurityTypeNone);
@@ -1268,6 +1311,18 @@ void QVncClient::Private::securityTypeChanged(SecurityType securityType)
             state = VncAuthenticationState;
             break;
         default:
+            break;
+        }
+        break;
+    case SecurityTypeVeNCrypt:
+        switch (protocolVersion) {
+        case ProtocolVersion37:
+        case ProtocolVersion38:
+            write(securityType);
+            state = VeNCryptVersionState;
+            break;
+        default:
+            qCWarning(lcVncClient) << "VeNCrypt requires protocol 3.7+";
             break;
         }
         break;
@@ -1342,6 +1397,185 @@ void QVncClient::Private::sendVncAuthResponse()
     default:
         break;
     }
+}
+
+void QVncClient::Private::parseVeNCryptVersion()
+{
+    if (socket->bytesAvailable() < 2)
+        return;
+    quint8 major, minor;
+    read(&major);
+    read(&minor);
+    qCDebug(lcVncClient) << "VeNCrypt server version:" << major << minor;
+    // Send client version 0.2
+    const quint8 clientMajor = 0;
+    const quint8 clientMinor = 2;
+    write(clientMajor);
+    write(clientMinor);
+    state = VeNCryptSubTypeState;
+}
+
+void QVncClient::Private::parseVeNCryptSubTypes()
+{
+    // Peek-before-consume: need at least status(1) + count(1)
+    if (socket->bytesAvailable() < 2)
+        return;
+    const QByteArray header = socket->peek(2);
+    const quint8 status = static_cast<quint8>(header[0]);
+    if (status != 0) {
+        socket->read(1); // consume status
+        qCWarning(lcVncClient) << "VeNCrypt version not accepted by server";
+        return;
+    }
+    const quint8 count = static_cast<quint8>(header[1]);
+    if (count == 0) {
+        socket->read(2); // consume status + count
+        qCWarning(lcVncClient) << "VeNCrypt: no sub-types offered";
+        return;
+    }
+    // Need status(1) + count(1) + count*4 bytes
+    if (socket->bytesAvailable() < 2 + count * 4)
+        return;
+    socket->read(2); // consume status + count
+    QList<quint32> subTypes;
+    for (int i = 0; i < count; i++) {
+        quint32_be subType;
+        read(&subType);
+        subTypes.append(subType);
+    }
+    qCDebug(lcVncClient) << "VeNCrypt sub-types offered:" << subTypes;
+
+    // Select best sub-type (preference order)
+    const QList<quint32> preference = {
+#if QT_CONFIG(ssl)
+        VeNCryptX509Plain,
+        VeNCryptX509Vnc,
+        VeNCryptX509None,
+        VeNCryptTLSPlain,
+        VeNCryptTLSVnc,
+        VeNCryptTLSNone,
+#endif
+        VeNCryptPlain,
+    };
+    veNCryptSubType = 0;
+    for (quint32 pref : preference) {
+        if (subTypes.contains(pref)) {
+            veNCryptSubType = pref;
+            break;
+        }
+    }
+    if (veNCryptSubType == 0) {
+        qCWarning(lcVncClient) << "VeNCrypt: no supported sub-type found";
+        return;
+    }
+    qCDebug(lcVncClient) << "VeNCrypt selected sub-type:" << veNCryptSubType;
+    quint32_be selected(veNCryptSubType);
+    write(selected);
+    state = VeNCryptAckState;
+}
+
+void QVncClient::Private::parseVeNCryptAck()
+{
+    if (socket->bytesAvailable() < 1)
+        return;
+    quint8 ack;
+    read(&ack);
+    if (ack != 1) {
+        qCWarning(lcVncClient) << "VeNCrypt sub-type rejected by server";
+        return;
+    }
+    qCDebug(lcVncClient) << "VeNCrypt sub-type accepted";
+
+    switch (veNCryptSubType) {
+#if QT_CONFIG(ssl)
+    case VeNCryptTLSNone:
+    case VeNCryptTLSVnc:
+    case VeNCryptTLSPlain:
+    case VeNCryptX509None:
+    case VeNCryptX509Vnc:
+    case VeNCryptX509Plain:
+        startTLSHandshake();
+        break;
+#endif
+    case VeNCryptPlain:
+        state = PlainAuthenticationState;
+        parsePlainAuthentication();
+        break;
+    default:
+        qCWarning(lcVncClient) << "VeNCrypt: unexpected sub-type in ack";
+        break;
+    }
+}
+
+void QVncClient::Private::startTLSHandshake()
+{
+#if QT_CONFIG(ssl)
+    auto *sslSocket = qobject_cast<QSslSocket *>(socket);
+    if (!sslSocket) {
+        qCWarning(lcVncClient) << "VeNCrypt TLS sub-type selected but socket is not QSslSocket";
+        return;
+    }
+    state = VeNCryptTLSState;
+    sslSocket->setPeerVerifyMode(QSslSocket::QueryPeer);
+    QObject::connect(sslSocket, &QSslSocket::encrypted, q, [this]() {
+        tlsHandshakeFinished();
+    });
+    sslSocket->startClientEncryption();
+#else
+    qCWarning(lcVncClient) << "VeNCrypt TLS sub-type selected but SSL is not available";
+#endif
+}
+
+void QVncClient::Private::tlsHandshakeFinished()
+{
+    qCDebug(lcVncClient) << "TLS handshake finished for VeNCrypt sub-type:" << veNCryptSubType;
+    switch (veNCryptSubType) {
+    case VeNCryptTLSNone:
+    case VeNCryptX509None:
+        state = SecurityResultState;
+        read();
+        break;
+    case VeNCryptTLSVnc:
+    case VeNCryptX509Vnc:
+        state = VncAuthenticationState;
+        read();
+        break;
+    case VeNCryptTLSPlain:
+    case VeNCryptX509Plain:
+        state = PlainAuthenticationState;
+        parsePlainAuthentication();
+        break;
+    default:
+        break;
+    }
+}
+
+void QVncClient::Private::parsePlainAuthentication()
+{
+    if (username.isEmpty()) {
+        emit q->usernameRequested();
+        return;
+    }
+    if (password.isEmpty()) {
+        emit q->passwordRequested();
+        return;
+    }
+    sendPlainAuthResponse();
+}
+
+void QVncClient::Private::sendPlainAuthResponse()
+{
+    const QByteArray userBytes = username.toUtf8();
+    const QByteArray passBytes = password.toUtf8();
+    quint32_be userLen(static_cast<quint32>(userBytes.size()));
+    quint32_be passLen(static_cast<quint32>(passBytes.size()));
+    write(userLen);
+    write(passLen);
+    if (isValid()) {
+        socket->write(userBytes);
+        socket->write(passBytes);
+    }
+    state = SecurityResultState;
 }
 
 /*!
@@ -2754,6 +2988,31 @@ void QVncClient::setFramebufferUpdatesEnabled(bool enabled)
     emit framebufferUpdatesEnabledChanged(enabled);
     if (enabled)
         d->restartFramebufferUpdates();
+}
+
+/*!
+    Returns the username used for VeNCrypt Plain authentication.
+
+    \sa setUsername(), usernameChanged()
+*/
+QString QVncClient::username() const
+{
+    return d->username;
+}
+
+/*!
+    Sets the username to \a username for VeNCrypt Plain authentication.
+
+    If the server is waiting for Plain credentials and both username
+    and password are now set, the authentication response is sent immediately.
+
+    \sa username(), usernameChanged(), usernameRequested()
+*/
+void QVncClient::setUsername(const QString &username)
+{
+    if (d->username == username) return;
+    d->username = username;
+    emit usernameChanged(username);
 }
 
 /*!

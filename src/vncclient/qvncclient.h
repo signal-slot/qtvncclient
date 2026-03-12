@@ -19,6 +19,7 @@ class Q_VNCCLIENT_EXPORT QVncClient : public QObject
     Q_PROPERTY(ProtocolVersion protocolVersion READ protocolVersion NOTIFY protocolVersionChanged)
     Q_PROPERTY(SecurityType securityType READ securityType NOTIFY securityTypeChanged)
     Q_PROPERTY(QString password READ password WRITE setPassword NOTIFY passwordChanged)
+    Q_PROPERTY(QString username READ username WRITE setUsername NOTIFY usernameChanged)
     Q_PROPERTY(bool framebufferUpdatesEnabled READ framebufferUpdatesEnabled WRITE setFramebufferUpdatesEnabled NOTIFY framebufferUpdatesEnabledChanged)
 public:
     enum ProtocolVersion {
@@ -28,7 +29,7 @@ public:
         ProtocolVersion38 = 0x0308,
     };
     Q_ENUM(ProtocolVersion)
-    
+
     enum SecurityType : qint8 {
         SecurityTypeUnknwon = -1,
         SecurityTypeInvalid = 0,
@@ -43,8 +44,20 @@ public:
         SecurityTypeGtkVncSasl = 20,
         SecurityTypeMd5HashAuthentication = 21,
         SecurityTypeColinDeanXvp = 22,
+        SecurityTypeAppleDH = 30,
     };
     Q_ENUM(SecurityType)
+
+    enum VeNCryptSubType : quint32 {
+        VeNCryptPlain = 256,
+        VeNCryptTLSNone = 257,
+        VeNCryptTLSVnc = 258,
+        VeNCryptTLSPlain = 259,
+        VeNCryptX509None = 260,
+        VeNCryptX509Vnc = 261,
+        VeNCryptX509Plain = 262,
+    };
+    Q_ENUM(VeNCryptSubType)
 
     explicit QVncClient(QObject *parent = nullptr);
     ~QVncClient() override;
@@ -52,16 +65,17 @@ public:
     QTcpSocket *socket() const;
     ProtocolVersion protocolVersion() const;
     SecurityType securityType() const;
-    
+
     // Get framebuffer size
     int framebufferWidth() const;
     int framebufferHeight() const;
 
     bool framebufferUpdatesEnabled() const;
-    
+
     // Get current image
     QImage image() const;
     QString password() const;
+    QString username() const;
 
     // Cursor data from RichCursor/CursorPos pseudo-encodings
     QImage cursorImage() const;
@@ -75,6 +89,7 @@ public:
 public slots:
     void setSocket(QTcpSocket *socket);
     void setPassword(const QString &password);
+    void setUsername(const QString &username);
     void setFramebufferUpdatesEnabled(bool enabled);
     void sendClipboardText(const QString &text);
     void sendClipboardImage(const QImage &image);
@@ -92,6 +107,8 @@ signals:
     void connectionStateChanged(bool connected);
     void passwordChanged(const QString &password);
     void passwordRequested();
+    void usernameChanged(const QString &username);
+    void usernameRequested();
     void framebufferUpdatesEnabledChanged(bool enabled);
     void framebufferUpdated();
     void cursorChanged();

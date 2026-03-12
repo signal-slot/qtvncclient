@@ -11,6 +11,9 @@
 #include <QtCore/QTimer>
 #include <QtWidgets/QPushButton>
 #include <QtNetwork/QTcpSocket>
+#if QT_CONFIG(ssl)
+#include <QtNetwork/QSslSocket>
+#endif
 
 class MainWindow::Private : public Ui::MainWindow
 {
@@ -21,7 +24,11 @@ public:
 private:
     ::MainWindow *q;
     QSettings settings;
+#if QT_CONFIG(ssl)
+    QSslSocket socket;
+#else
     QTcpSocket socket;
+#endif
     QTimer timer;
     QVncClient vncClient;
 };
@@ -37,6 +44,9 @@ MainWindow::Private::Private(::MainWindow *parent)
         watch->animateClick();
     });
     connect(port, &SpinBox::returnPressed, q, [this]() {
+        watch->animateClick();
+    });
+    connect(username, &QLineEdit::returnPressed, q, [this]() {
         watch->animateClick();
     });
     connect(password, &QLineEdit::returnPressed, q, [this]() {
@@ -70,6 +80,12 @@ MainWindow::Private::Private(::MainWindow *parent)
     if (socket.state() == QTcpSocket::UnconnectedState)
         timer.start();
     
+    // Handle server requesting username when none was set
+    connect(&vncClient, &QVncClient::usernameRequested, q, [this]() {
+        stackedWidget->setCurrentIndex(0);
+        username->setFocus();
+    });
+
     // Handle server requesting password when none was set
     connect(&vncClient, &QVncClient::passwordRequested, q, [this]() {
         stackedWidget->setCurrentIndex(0);
@@ -82,6 +98,7 @@ MainWindow::Private::Private(::MainWindow *parent)
         settings.setValue("small_geometry", q->saveGeometry());
         settings.setValue("server", server->text());
         settings.setValue("port", port->value());
+        vncClient.setUsername(username->text());
         vncClient.setPassword(password->text());
         socket.connectToHost(server->text(), port->value());
         stackedWidget->setCurrentIndex(1);
