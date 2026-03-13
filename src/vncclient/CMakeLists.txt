@@ -32,3 +32,9 @@ if(VNCCLIENT_USE_ZLIB AND ZLIB_FOUND)
     target_link_libraries(VncClient PRIVATE ZLIB::ZLIB)
 endif()
 
+# Link OpenSSL for Apple DH authentication (Security Type 30)
+find_package(OpenSSL)
+if(OpenSSL_FOUND)
+    target_link_libraries(VncClient PRIVATE OpenSSL::Crypto)
+endif()
+

@@ -50,6 +50,10 @@
 
 #if QT_CONFIG(ssl)
 #include <QtNetwork/QSslSocket>
+#include <openssl/bn.h>
+#include <openssl/evp.h>
+#include <QtCore/QCryptographicHash>
+#include <QtCore/QRandomGenerator>
 #endif
 
 /*!
@@ -82,6 +86,7 @@ public:
         VeNCryptAckState = 0x617,     ///< VeNCrypt sub-type acknowledgement
         VeNCryptTLSState = 0x618,     ///< VeNCrypt TLS handshake
         PlainAuthenticationState = 0x619, ///< VeNCrypt Plain authentication
+        AppleDHState = 0x61A,         ///< Apple DH authentication (Security Type 30)
         ClientInitState = 0x631,      ///< Client initialization
         ServerInitState = 0x632,      ///< Server initialization
         WaitingState = 0x640,         ///< Normal operation state, waiting for server messages
@@ -411,6 +416,7 @@ private:
     void tlsHandshakeFinished();
     void parsePlainAuthentication();
     void sendPlainAuthResponse();
+    void parseAppleDH();
 
     /*!
         \internal
@@ -717,10 +723,14 @@ QVncClient::Private::Private(QVncClient *parent)
             sendVncAuthResponse();
         if (state == PlainAuthenticationState && !username.isEmpty() && !password.isEmpty())
             sendPlainAuthResponse();
+        if (state == AppleDHState && !username.isEmpty() && !password.isEmpty())
+            parseAppleDH();
     });
     connect(q, &QVncClient::usernameChanged, q, [this](const QString &) {
         if (state == PlainAuthenticationState && !username.isEmpty() && !password.isEmpty())
             sendPlainAuthResponse();
+        if (state == AppleDHState && !username.isEmpty() && !password.isEmpty())
+            parseAppleDH();
     });
 }
 
@@ -782,6 +792,9 @@ void QVncClient::Private::read()
         break;
     case PlainAuthenticationState:
         parsePlainAuthentication();
+        break;
+    case AppleDHState:
+        parseAppleDH();
         break;
     case SecurityResultState:
         parseSecurityResult();
@@ -1257,6 +1270,8 @@ void QVncClient::Private::parseSecurity37()
     }
     if (securityTypes.contains(SecurityTypeVeNCrypt))
         q->setSecurityType(SecurityTypeVeNCrypt);
+    else if (securityTypes.contains(SecurityTypeAppleDH))
+        q->setSecurityType(SecurityTypeAppleDH);
     else if (securityTypes.contains(SecurityTypeVncAuthentication))
         q->setSecurityType(SecurityTypeVncAuthentication);
     else if (securityTypes.contains(SecurityTypeNone))
@@ -1323,6 +1338,20 @@ void QVncClient::Private::securityTypeChanged(SecurityType securityType)
             break;
         default:
             qCWarning(lcVncClient) << "VeNCrypt requires protocol 3.7+";
+            break;
+        }
+        break;
+    case SecurityTypeAppleDH:
+        switch (protocolVersion) {
+        case ProtocolVersion33:
+            state = AppleDHState;
+            break;
+        case ProtocolVersion37:
+        case ProtocolVersion38:
+            write(securityType);
+            state = AppleDHState;
+            break;
+        default:
             break;
         }
         break;
@@ -1576,6 +1605,139 @@ void QVncClient::Private::sendPlainAuthResponse()
         socket->write(passBytes);
     }
     state = SecurityResultState;
+}
+
+void QVncClient::Private::parseAppleDH()
+{
+#if QT_CONFIG(ssl)
+    // Server sends: generator(2) + keyLength(2) + prime(keyLength) + pubKey(keyLength)
+    if (socket->bytesAvailable() < 4)
+        return;
+    const QByteArray header = socket->peek(4);
+    const quint16 generator = (static_cast<quint8>(header[0]) << 8)
+                            | static_cast<quint8>(header[1]);
+    const quint16 keyLength = (static_cast<quint8>(header[2]) << 8)
+                            | static_cast<quint8>(header[3]);
+    const qint64 totalSize = 4 + static_cast<qint64>(keyLength) * 2;
+    if (socket->bytesAvailable() < totalSize)
+        return;
+
+    if (username.isEmpty()) {
+        emit q->usernameRequested();
+        return;
+    }
+    if (password.isEmpty()) {
+        emit q->passwordRequested();
+        return;
+    }
+
+    // Consume the header
+    socket->read(4);
+    const QByteArray primeBytes = socket->read(keyLength);
+    const QByteArray serverPubBytes = socket->read(keyLength);
+
+    qCDebug(lcVncClient) << "Apple DH: generator=" << generator
+                         << "keyLength=" << keyLength;
+
+    // Set up bignums
+    BIGNUM *prime = BN_bin2bn(
+        reinterpret_cast<const unsigned char *>(primeBytes.constData()),
+        primeBytes.size(), nullptr);
+    BIGNUM *serverPub = BN_bin2bn(
+        reinterpret_cast<const unsigned char *>(serverPubBytes.constData()),
+        serverPubBytes.size(), nullptr);
+    BIGNUM *gen = BN_new();
+    BN_set_word(gen, generator);
+
+    // Generate client private key (random)
+    BIGNUM *clientPriv = BN_new();
+    BN_rand(clientPriv, keyLength * 8, -1, 0);
+
+    // Compute client public key: g^b mod p
+    BIGNUM *clientPub = BN_new();
+    BN_CTX *ctx = BN_CTX_new();
+    BN_mod_exp(clientPub, gen, clientPriv, prime, ctx);
+
+    // Compute shared secret: serverPub^clientPriv mod p
+    BIGNUM *sharedSecret = BN_new();
+    BN_mod_exp(sharedSecret, serverPub, clientPriv, prime, ctx);
+
+    // Convert shared secret to keyLength bytes (zero-padded big-endian)
+    QByteArray secretBytes(keyLength, '\0');
+    const int secretLen = BN_num_bytes(sharedSecret);
+    BN_bn2bin(sharedSecret, reinterpret_cast<unsigned char *>(
+        secretBytes.data() + keyLength - secretLen));
+
+    // Derive AES key: MD5(sharedSecret)
+    const QByteArray aesKey = QCryptographicHash::hash(secretBytes, QCryptographicHash::Md5);
+
+    // Pack credentials: username[64] + password[64], random-padded
+    QByteArray credentials(128, '\0');
+    // Fill with random data first
+    for (int i = 0; i < 128; i += 4) {
+        quint32 r = QRandomGenerator::global()->generate();
+        qToBigEndian(r, credentials.data() + i);
+    }
+    // Copy username (null-terminated, max 63 chars)
+    const QByteArray userBytes = username.toUtf8().left(63);
+    memcpy(credentials.data(), userBytes.constData(), userBytes.size());
+    credentials[userBytes.size()] = '\0';
+    // Copy password (null-terminated, max 63 chars)
+    const QByteArray passBytes = password.toUtf8().left(63);
+    memcpy(credentials.data() + 64, passBytes.constData(), passBytes.size());
+    credentials[64 + passBytes.size()] = '\0';
+
+    // Encrypt with AES-128-ECB
+    QByteArray ciphertext(128 + EVP_MAX_BLOCK_LENGTH, '\0');
+    int outLen = 0, finalLen = 0;
+    EVP_CIPHER_CTX *aesCtx = EVP_CIPHER_CTX_new();
+    EVP_EncryptInit_ex(aesCtx, EVP_aes_128_ecb(), nullptr,
+                       reinterpret_cast<const unsigned char *>(aesKey.constData()),
+                       nullptr);
+    EVP_CIPHER_CTX_set_padding(aesCtx, 0); // no padding, exact 128 bytes = 8 blocks
+    EVP_EncryptUpdate(aesCtx,
+                      reinterpret_cast<unsigned char *>(ciphertext.data()), &outLen,
+                      reinterpret_cast<const unsigned char *>(credentials.constData()),
+                      128);
+    EVP_EncryptFinal_ex(aesCtx,
+                        reinterpret_cast<unsigned char *>(ciphertext.data()) + outLen,
+                        &finalLen);
+    EVP_CIPHER_CTX_free(aesCtx);
+    ciphertext.resize(outLen + finalLen);
+
+    // Convert client public key to keyLength bytes (zero-padded big-endian)
+    QByteArray clientPubBytes(keyLength, '\0');
+    const int pubLen = BN_num_bytes(clientPub);
+    BN_bn2bin(clientPub, reinterpret_cast<unsigned char *>(
+        clientPubBytes.data() + keyLength - pubLen));
+
+    // Send: ciphertext(128) + clientPublicKey(keyLength)
+    if (isValid()) {
+        socket->write(ciphertext);
+        socket->write(clientPubBytes);
+    }
+
+    // Clean up
+    BN_free(prime);
+    BN_free(serverPub);
+    BN_free(gen);
+    BN_free(clientPriv);
+    BN_free(clientPub);
+    BN_free(sharedSecret);
+    BN_CTX_free(ctx);
+
+    switch (protocolVersion) {
+    case ProtocolVersion33:
+        state = ClientInitState;
+        clientInit();
+        break;
+    default:
+        state = SecurityResultState;
+        break;
+    }
+#else
+    qCWarning(lcVncClient) << "Apple DH authentication requires SSL/OpenSSL support";
+#endif
 }
 
 /*!
@@ -2742,7 +2904,7 @@ bool QVncClient::Private::handleZRLEEncoding(const Rectangle &rect)
 */
 void QVncClient::Private::keyEvent(QKeyEvent *e)
 {
-    if (!socket) return;
+    if (!socket || state != WaitingState) return;
     const quint8 messageType = KeyEvent;
     write(messageType);
     const quint8 downFlag = e->type() == QEvent::KeyPress ? 1 : 0;
@@ -2767,7 +2929,7 @@ void QVncClient::Private::keyEvent(QKeyEvent *e)
 */
 void QVncClient::Private::pointerEvent(QMouseEvent *e)
 {
-    if (!socket) return;
+    if (!socket || state != WaitingState) return;
     const quint8 messageType = PointerEvent;
     write(messageType);
 
