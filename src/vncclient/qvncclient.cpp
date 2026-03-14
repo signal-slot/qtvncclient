@@ -50,6 +50,9 @@
 
 #if QT_CONFIG(ssl)
 #include <QtNetwork/QSslSocket>
+#endif
+
+#ifdef USE_OPENSSL
 #include <openssl/bn.h>
 #include <openssl/evp.h>
 #include <QtCore/QCryptographicHash>
@@ -1609,7 +1612,7 @@ void QVncClient::Private::sendPlainAuthResponse()
 
 void QVncClient::Private::parseAppleDH()
 {
-#if QT_CONFIG(ssl)
+#ifdef USE_OPENSSL
     // Server sends: generator(2) + keyLength(2) + prime(keyLength) + pubKey(keyLength)
     if (socket->bytesAvailable() < 4)
         return;
@@ -1736,7 +1739,7 @@ void QVncClient::Private::parseAppleDH()
         break;
     }
 #else
-    qCWarning(lcVncClient) << "Apple DH authentication requires SSL/OpenSSL support";
+    qCWarning(lcVncClient) << "Apple DH authentication requires OpenSSL support";
 #endif
 }
 

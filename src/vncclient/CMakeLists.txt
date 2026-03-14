@@ -36,5 +36,6 @@ endif()
 find_package(OpenSSL)
 if(OpenSSL_FOUND)
     target_link_libraries(VncClient PRIVATE OpenSSL::Crypto)
+    target_compile_definitions(VncClient PRIVATE USE_OPENSSL)
 endif()
 
